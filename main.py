@@ -3,7 +3,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import sys
+from pathlib import Path
 from typing import Any
+
+plugin_root = Path(__file__).parent
+if str(plugin_root) not in sys.path:
+    sys.path.insert(0, str(plugin_root))
 
 from astrbot.api.star import Star, Context
 from astrbot.api.event import filter, AstrMessageEvent
