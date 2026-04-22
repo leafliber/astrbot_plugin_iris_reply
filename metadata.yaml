@@ -1,0 +1,6 @@
+name: astrbot_plugin_iris_reply
+desc: Iris Reply - 主动回复插件，提供主动接入群聊、跟进回复和关键词响应功能
+help: 使用 /iris_reply 查看帮助
+version: 0.1.0
+author: leafliber
+repo: https://github.com/leafliber/astrbot_plugin_iris_reply
