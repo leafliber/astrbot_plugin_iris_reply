@@ -83,7 +83,7 @@
       "type": "string",
       "default": "",
       "description": "跟进回复使用的 LLM Provider ID（留空使用默认）",
-      "_special": "select_provider" 
+      "_special": "select_provider"
     }
   },
   "keyword": {
