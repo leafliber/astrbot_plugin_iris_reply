@@ -36,6 +36,19 @@ class KeywordValidator:
         group_id: str,
         user_id: str,
     ) -> ValidationResult:
+        force_keywords = self._config.keyword.get("force_reply_keywords", [])
+        if force_keywords:
+            message_lower = message.lower()
+            for fk in force_keywords:
+                if fk.lower() in message_lower:
+                    logger.info("命中强制回复关键词: %s", fk)
+                    return ValidationResult(
+                        should_reply=True,
+                        confidence=1.0,
+                        reason=f"命中强制回复关键词 '{fk}'",
+                        reply_direction=f"用户消息包含强制关键词 '{fk}'",
+                    )
+
         mode = self._config.keyword.get("validation_mode", "llm")
 
         if mode == "rule":

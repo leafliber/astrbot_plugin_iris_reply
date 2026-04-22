@@ -29,7 +29,8 @@
     "llm_provider_id": {
       "type": "string",
       "default": "",
-      "description": "主动回复使用的 LLM Provider ID（留空使用默认）"
+      "description": "主动回复使用的 LLM Provider ID（留空使用默认）",
+      "_special": "select_provider"
     },
     "analysis_window_messages": {
       "type": "int",
@@ -81,7 +82,8 @@
     "llm_provider_id": {
       "type": "string",
       "default": "",
-      "description": "跟进回复使用的 LLM Provider ID（留空使用默认）"
+      "description": "跟进回复使用的 LLM Provider ID（留空使用默认）",
+      "_special": "select_provider" 
     }
   },
   "keyword": {
@@ -123,8 +125,13 @@
     },
     "max_keywords_per_group": {
       "type": "int",
-      "default": 50,
+      "default": 20,
       "description": "每群最大关键词数"
+    },
+    "force_reply_keywords": {
+      "type": "list",
+      "default": [],
+      "description": "强制回复关键词列表（命中时100%回复，跳过LLM验证）"
     }
   },
   "memory": {

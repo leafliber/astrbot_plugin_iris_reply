@@ -35,7 +35,8 @@ _DEFAULTS: dict[str, Any] = {
         "validation_mode": "llm",
         "validation_threshold": 0.7,
         "llm_provider_id": "",
-        "max_keywords_per_group": 50,
+        "max_keywords_per_group": 20,
+        "force_reply_keywords": [],
     },
     "memory": {
         "integration_mode": "auto",
