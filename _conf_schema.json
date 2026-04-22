@@ -1,172 +1,192 @@
 {
   "proactive": {
-    "enable": {
-      "type": "bool",
-      "default": false,
-      "description": "启用主动接入群聊对话"
-    },
-    "mode": {
-      "type": "string",
-      "default": "rule",
-      "description": "分析模式：rule(规则) / llm / hybrid(混合)",
-      "enum": ["rule", "llm", "hybrid"]
-    },
-    "min_interval_seconds": {
-      "type": "int",
-      "default": 300,
-      "description": "两次主动回复最小间隔（秒）"
-    },
-    "max_replies_per_hour": {
-      "type": "int",
-      "default": 3,
-      "description": "每小时最大主动回复数"
-    },
-    "group_whitelist_mode": {
-      "type": "bool",
-      "default": true,
-      "description": "白名单模式（需手动开启群）"
-    },
-    "llm_provider_id": {
-      "type": "string",
-      "default": "",
-      "description": "主动回复使用的 LLM Provider ID（留空使用默认）",
-      "_special": "select_provider"
-    },
-    "analysis_window_messages": {
-      "type": "int",
-      "default": 10,
-      "description": "分析窗口消息数量"
-    },
-    "relevance_threshold": {
-      "type": "float",
-      "default": 0.6,
-      "description": "话题相关性阈值"
-    },
-    "intent_threshold": {
-      "type": "float",
-      "default": 0.5,
-      "description": "意图信号阈值"
-    },
-    "silence_gap_seconds": {
-      "type": "int",
-      "default": 120,
-      "description": "沉默间隔阈值（秒）"
+    "type": "object",
+    "description": "主动接入群聊对话配置",
+    "items": {
+      "enable": {
+        "type": "bool",
+        "default": false,
+        "description": "启用主动接入群聊对话"
+      },
+      "mode": {
+        "type": "string",
+        "default": "rule",
+        "description": "分析模式：rule(规则) / llm / hybrid(混合)",
+        "enum": ["rule", "llm", "hybrid"]
+      },
+      "min_interval_seconds": {
+        "type": "int",
+        "default": 300,
+        "description": "两次主动回复最小间隔（秒）"
+      },
+      "max_replies_per_hour": {
+        "type": "int",
+        "default": 3,
+        "description": "每小时最大主动回复数"
+      },
+      "group_whitelist_mode": {
+        "type": "bool",
+        "default": true,
+        "description": "白名单模式（需手动开启群）"
+      },
+      "llm_provider_id": {
+        "type": "string",
+        "default": "",
+        "description": "主动回复使用的 LLM Provider ID（留空使用默认）",
+        "_special": "select_provider"
+      },
+      "analysis_window_messages": {
+        "type": "int",
+        "default": 10,
+        "description": "分析窗口消息数量"
+      },
+      "relevance_threshold": {
+        "type": "float",
+        "default": 0.6,
+        "description": "话题相关性阈值"
+      },
+      "intent_threshold": {
+        "type": "float",
+        "default": 0.5,
+        "description": "意图信号阈值"
+      },
+      "silence_gap_seconds": {
+        "type": "int",
+        "default": 120,
+        "description": "沉默间隔阈值（秒）"
+      }
     }
   },
   "followup": {
-    "enable": {
-      "type": "bool",
-      "default": false,
-      "description": "启用跟进回复"
-    },
-    "delay_seconds_min": {
-      "type": "int",
-      "default": 30,
-      "description": "跟进最小延迟（秒）"
-    },
-    "delay_seconds_max": {
-      "type": "int",
-      "default": 120,
-      "description": "跟进最大延迟（秒）"
-    },
-    "max_wait_messages": {
-      "type": "int",
-      "default": 5,
-      "description": "跟进最多等待消息数"
-    },
-    "followup_after_all_replies": {
-      "type": "bool",
-      "default": false,
-      "description": "是否在所有回复后都尝试跟进"
-    },
-    "llm_provider_id": {
-      "type": "string",
-      "default": "",
-      "description": "跟进回复使用的 LLM Provider ID（留空使用默认）",
-      "_special": "select_provider"
+    "type": "object",
+    "description": "跟进回复配置",
+    "items": {
+      "enable": {
+        "type": "bool",
+        "default": false,
+        "description": "启用跟进回复"
+      },
+      "delay_seconds_min": {
+        "type": "int",
+        "default": 30,
+        "description": "跟进最小延迟（秒）"
+      },
+      "delay_seconds_max": {
+        "type": "int",
+        "default": 120,
+        "description": "跟进最大延迟（秒）"
+      },
+      "max_wait_messages": {
+        "type": "int",
+        "default": 5,
+        "description": "跟进最多等待消息数"
+      },
+      "followup_after_all_replies": {
+        "type": "bool",
+        "default": false,
+        "description": "是否在所有回复后都尝试跟进"
+      },
+      "llm_provider_id": {
+        "type": "string",
+        "default": "",
+        "description": "跟进回复使用的 LLM Provider ID（留空使用默认）",
+        "_special": "select_provider"
+      }
     }
   },
   "keyword": {
-    "enable": {
-      "type": "bool",
-      "default": true,
-      "description": "启用关键词响应"
-    },
-    "static_keywords": {
-      "type": "list",
-      "default": ["帮我", "怎么办", "求助", "请问"],
-      "description": "静态关键词列表"
-    },
-    "dynamic_generation": {
-      "type": "bool",
-      "default": true,
-      "description": "启用动态关键词生成"
-    },
-    "dynamic_refresh_interval_minutes": {
-      "type": "int",
-      "default": 60,
-      "description": "动态关键词刷新间隔（分钟）"
-    },
-    "validation_mode": {
-      "type": "string",
-      "default": "llm",
-      "description": "验证模式：rule / llm",
-      "enum": ["rule", "llm"]
-    },
-    "validation_threshold": {
-      "type": "float",
-      "default": 0.7,
-      "description": "LLM 验证置信度阈值"
-    },
-    "llm_provider_id": {
-      "type": "string",
-      "default": "",
-      "description": "关键词验证使用的 LLM Provider ID（留空使用默认）"
-    },
-    "max_keywords_per_group": {
-      "type": "int",
-      "default": 20,
-      "description": "每群最大关键词数"
-    },
-    "force_reply_keywords": {
-      "type": "list",
-      "default": [],
-      "description": "强制回复关键词列表（命中时100%回复，跳过LLM验证）"
+    "type": "object",
+    "description": "关键词响应配置",
+    "items": {
+      "enable": {
+        "type": "bool",
+        "default": true,
+        "description": "启用关键词响应"
+      },
+      "static_keywords": {
+        "type": "list",
+        "default": ["帮我", "怎么办", "求助", "请问"],
+        "description": "静态关键词列表"
+      },
+      "dynamic_generation": {
+        "type": "bool",
+        "default": true,
+        "description": "启用动态关键词生成"
+      },
+      "dynamic_refresh_interval_minutes": {
+        "type": "int",
+        "default": 60,
+        "description": "动态关键词刷新间隔（分钟）"
+      },
+      "validation_mode": {
+        "type": "string",
+        "default": "llm",
+        "description": "验证模式：rule / llm",
+        "enum": ["rule", "llm"]
+      },
+      "validation_threshold": {
+        "type": "float",
+        "default": 0.7,
+        "description": "LLM 验证置信度阈值"
+      },
+      "llm_provider_id": {
+        "type": "string",
+        "default": "",
+        "description": "关键词验证使用的 LLM Provider ID（留空使用默认）"
+      },
+      "max_keywords_per_group": {
+        "type": "int",
+        "default": 20,
+        "description": "每群最大关键词数"
+      },
+      "force_reply_keywords": {
+        "type": "list",
+        "default": [],
+        "description": "强制回复关键词列表（命中时100%回复，跳过LLM验证）"
+      }
     }
   },
   "memory": {
-    "integration_mode": {
-      "type": "string",
-      "default": "auto",
-      "description": "Memory 集成模式：auto(自动检测) / off(关闭)",
-      "enum": ["auto", "off"]
-    },
-    "fallback_on_unavailable": {
-      "type": "bool",
-      "default": true,
-      "description": "tier_memory 不可用时是否降级运行"
-    },
-    "max_context_messages": {
-      "type": "int",
-      "default": 10,
-      "description": "最大上下文消息数"
-    },
-    "max_memory_results": {
-      "type": "int",
-      "default": 5,
-      "description": "最大记忆检索结果数"
-    },
-    "max_knowledge_facts": {
-      "type": "int",
-      "default": 3,
-      "description": "最大知识图谱事实数"
+    "type": "object",
+    "description": "Memory 集成配置",
+    "items": {
+      "integration_mode": {
+        "type": "string",
+        "default": "auto",
+        "description": "Memory 集成模式：auto(自动检测) / off(关闭)",
+        "enum": ["auto", "off"]
+      },
+      "fallback_on_unavailable": {
+        "type": "bool",
+        "default": true,
+        "description": "tier_memory 不可用时是否降级运行"
+      },
+      "max_context_messages": {
+        "type": "int",
+        "default": 10,
+        "description": "最大上下文消息数"
+      },
+      "max_memory_results": {
+        "type": "int",
+        "default": 5,
+        "description": "最大记忆检索结果数"
+      },
+      "max_knowledge_facts": {
+        "type": "int",
+        "default": 3,
+        "description": "最大知识图谱事实数"
+      }
     }
   },
   "cooldown": {
-    "default_seconds": {
-      "type": "int",
-      "default": 300,
-      "description": "默认冷却时间（秒）"
+    "type": "object",
+    "description": "冷却时间配置",
+    "items": {
+      "default_seconds": {
+        "type": "int",
+        "default": 300,
+        "description": "默认冷却时间（秒）"
+      }
     }
   }
 }
