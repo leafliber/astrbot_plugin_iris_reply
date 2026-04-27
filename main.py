@@ -165,14 +165,14 @@ class IrisReply(Star):
 
         self._followup_scheduler.on_new_message(group_id)
 
-        if getattr(event, "is_at_or_wake_command", False):
-            return
-
         keyword_enabled = self._config.keyword.get("enable", True)
         if keyword_enabled:
-            handled = await self._handle_keyword(event, group_id, user_id, message)
-            if handled:
+            force_triggered = await self._handle_keyword(event, group_id, user_id, message)
+            if force_triggered:
                 return
+
+        if getattr(event, "is_at_or_wake_command", False):
+            return
 
         proactive_enabled = self._config.proactive.get("enable", False)
         group_config = self._store.get_group_config(group_id)
@@ -226,6 +226,15 @@ class IrisReply(Star):
     ) -> bool:
         if self._cooldown.is_on_cooldown(group_id):
             return False
+
+        force_keywords = self._config.keyword.get("force_reply_keywords", [])
+        if force_keywords:
+            message_lower = message.lower()
+            for fk in force_keywords:
+                if fk.lower() in message_lower:
+                    logger.info("命中强制回复关键词: %s，走 AstrBot 原生回复流程", fk)
+                    event.is_at_or_wake_command = True
+                    return True
 
         static_keywords = self._keyword_store.get_static_keywords(group_id)
         dynamic_keywords = self._keyword_store.get_dynamic_keywords(group_id)
