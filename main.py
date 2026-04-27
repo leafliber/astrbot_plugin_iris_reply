@@ -21,7 +21,7 @@ from iris_reply.core.llm_client import LLMClient
 from iris_reply.core.message_builder import MessageBuilder
 from iris_reply.core.reply_sender import ReplySender
 from iris_reply.storage.store import Store
-from iris_reply.models.models import FollowupPlan
+from iris_reply.models.models import FollowupPlan, KeywordSource
 from iris_reply.utils.cooldown import CooldownManager
 from iris_reply.utils.rate_limiter import RateLimiter
 from iris_reply.keyword.keyword_store import KeywordStore
@@ -224,14 +224,20 @@ class IrisReply(Star):
         if self._cooldown.is_on_cooldown(group_id):
             return False
 
-        all_keywords = self._keyword_store.get_all_keywords(group_id)
-        if not all_keywords:
+        static_keywords = self._keyword_store.get_static_keywords(group_id)
+        dynamic_keywords = self._keyword_store.get_dynamic_keywords(group_id)
+        if not static_keywords and not dynamic_keywords:
             return False
 
-        matches = self._keyword_matcher.match(message, all_keywords)
+        matches = []
+        if static_keywords:
+            matches.extend(self._keyword_matcher.match(message, static_keywords, KeywordSource.STATIC))
+        if dynamic_keywords:
+            matches.extend(self._keyword_matcher.match(message, dynamic_keywords, KeywordSource.DYNAMIC))
         if not matches:
             return False
 
+        matches.sort(key=lambda m: m.confidence, reverse=True)
         best_match = matches[0]
 
         validation = await self._keyword_validator.validate(
@@ -262,7 +268,6 @@ class IrisReply(Star):
         success = await self._reply_sender.send_group_message(group_id, reply)
         if success:
             self._cooldown.mark_reply(group_id)
-            self._rate_limiter.record(group_id)
             self._store.record_reply(
                 group_id, "keyword", best_match.keyword, validation.confidence
             )

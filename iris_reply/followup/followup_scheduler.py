@@ -66,6 +66,13 @@ class FollowupScheduler:
         try:
             await asyncio.sleep(plan.delay_seconds)
 
+            if self.should_cancel_on_message(group_id, plan):
+                logger.info(
+                    "群 %s 跟进已取消：延迟期间收到 %d 条消息，超过上限 %d",
+                    group_id, self._message_counts.get(group_id, 0), plan.max_wait_messages,
+                )
+                return
+
             if self._execute_callback is None:
                 logger.warning("跟进执行回调未设置")
                 return
@@ -81,10 +88,11 @@ class FollowupScheduler:
             self._message_counts.pop(group_id, None)
 
     async def shutdown(self) -> None:
-        for group_id, task in list(self._pending.items()):
+        tasks = list(self._pending.values())
+        for task in tasks:
             if not task.done():
                 task.cancel()
-        for group_id, task in self._pending.items():
+        for task in tasks:
             try:
                 await task
             except asyncio.CancelledError:

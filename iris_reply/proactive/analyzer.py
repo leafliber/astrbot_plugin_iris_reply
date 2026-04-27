@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import time
 from typing import Any
 
 from iris_reply.core.llm_client import LLMClient
@@ -148,15 +147,24 @@ class MessageAnalyzer:
     def _calc_silence_gap(self, messages: list[dict[str, Any]]) -> float:
         if not messages:
             return 0.0
-        last_ts = messages[-1].get("timestamp")
-        if last_ts is None:
+
+        timestamps: list[float] = []
+        for msg in messages:
+            ts = msg.get("timestamp")
+            if ts is not None and isinstance(ts, (int, float)):
+                timestamps.append(float(ts))
+
+        if len(timestamps) < 2:
             return 0.0
-        try:
-            if isinstance(last_ts, (int, float)):
-                return max(0.0, time.time() - last_ts)
-        except (TypeError, ValueError):
-            pass
-        return 0.0
+
+        timestamps.sort()
+
+        max_gap = 0.0
+        for i in range(1, len(timestamps)):
+            gap = timestamps[i] - timestamps[i - 1]
+            max_gap = max(max_gap, gap)
+
+        return max_gap
 
     def _summarize(self, messages: list[dict[str, Any]]) -> str:
         if not messages:
