@@ -147,7 +147,7 @@ class IrisReply(Star):
             self._cooldown.set_group_cooldown(g.group_id, g.cooldown_seconds)
 
     @filter.event_message_type(filter.EventMessageType.ALL)
-    async def on_message(self, event: AstrMessageEvent) -> None:
+    async def on_message(self, event: AstrMessageEvent):
         group_id = self._get_group_id(event)
         if not group_id:
             return
@@ -175,6 +175,7 @@ class IrisReply(Star):
         group_config = self._store.get_group_config(group_id)
         if proactive_enabled and group_config.proactive_enabled:
             await self._handle_proactive(event, group_id, user_id, message)
+        yield
 
     @filter.on_llm_response()
     async def on_llm_response(self, event: AstrMessageEvent, response: Any) -> None:
@@ -207,7 +208,7 @@ class IrisReply(Star):
         if not follow_all:
             return
 
-        await self._plan_followup(group_id, resp_text)
+        asyncio.create_task(self._plan_followup(group_id, resp_text))
 
     @filter.command("iris_reply")
     async def handle_command(self, event: AstrMessageEvent) -> None:
