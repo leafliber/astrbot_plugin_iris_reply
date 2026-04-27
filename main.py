@@ -165,6 +165,9 @@ class IrisReply(Star):
 
         self._followup_scheduler.on_new_message(group_id)
 
+        if getattr(event, "is_at_or_wake_command", False):
+            return
+
         keyword_enabled = self._config.keyword.get("enable", True)
         if keyword_enabled:
             handled = await self._handle_keyword(event, group_id, user_id, message)
