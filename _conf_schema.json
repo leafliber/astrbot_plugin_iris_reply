@@ -1,192 +1,59 @@
 {
-  "proactive": {
-    "type": "object",
-    "description": "主动接入群聊对话配置",
-    "items": {
-      "enable": {
-        "type": "bool",
-        "default": false,
-        "description": "启用主动接入群聊对话"
-      },
-      "mode": {
-        "type": "string",
-        "default": "rule",
-        "description": "分析模式：rule(规则) / llm / hybrid(混合)",
-        "enum": ["rule", "llm", "hybrid"]
-      },
-      "min_interval_seconds": {
-        "type": "int",
-        "default": 300,
-        "description": "两次主动回复最小间隔（秒）"
-      },
-      "max_replies_per_hour": {
-        "type": "int",
-        "default": 3,
-        "description": "每小时最大主动回复数"
-      },
-      "group_whitelist_mode": {
-        "type": "bool",
-        "default": true,
-        "description": "白名单模式（需手动开启群）"
-      },
-      "llm_provider_id": {
-        "type": "string",
-        "default": "",
-        "description": "主动回复使用的 LLM Provider ID（留空使用默认）",
-        "_special": "select_provider"
-      },
-      "analysis_window_messages": {
-        "type": "int",
-        "default": 10,
-        "description": "分析窗口消息数量"
-      },
-      "relevance_threshold": {
-        "type": "float",
-        "default": 0.6,
-        "description": "话题相关性阈值"
-      },
-      "intent_threshold": {
-        "type": "float",
-        "default": 0.5,
-        "description": "意图信号阈值"
-      },
-      "silence_gap_seconds": {
-        "type": "int",
-        "default": 120,
-        "description": "沉默间隔阈值（秒）"
-      }
-    }
+  "proactive_enabled": {
+    "type": "bool",
+    "default": true,
+    "description": "主动回复总开关。关闭后插件不再主动发送任何消息，仅响应 /iris_reply 指令"
   },
-  "followup": {
-    "type": "object",
-    "description": "跟进回复配置",
-    "items": {
-      "enable": {
-        "type": "bool",
-        "default": false,
-        "description": "启用跟进回复"
-      },
-      "delay_seconds_min": {
-        "type": "int",
-        "default": 30,
-        "description": "跟进最小延迟（秒）"
-      },
-      "delay_seconds_max": {
-        "type": "int",
-        "default": 120,
-        "description": "跟进最大延迟（秒）"
-      },
-      "max_wait_messages": {
-        "type": "int",
-        "default": 5,
-        "description": "跟进最多等待消息数"
-      },
-      "followup_after_all_replies": {
-        "type": "bool",
-        "default": false,
-        "description": "是否在所有回复后都尝试跟进"
-      },
-      "llm_provider_id": {
-        "type": "string",
-        "default": "",
-        "description": "跟进回复使用的 LLM Provider ID（留空使用默认）",
-        "_special": "select_provider"
-      }
-    }
+  "proactive_mode": {
+    "type": "string",
+    "default": "rule",
+    "description": "决策模式。rule：纯规则判断，信号权重达到直接回复阈值即回复；hybrid：规则+LLM确认，权重在两阈值之间时由LLM二次确认是否回复",
+    "options": ["rule", "hybrid"]
   },
-  "keyword": {
-    "type": "object",
-    "description": "关键词响应配置",
-    "items": {
-      "enable": {
-        "type": "bool",
-        "default": true,
-        "description": "启用关键词响应"
-      },
-      "static_keywords": {
-        "type": "list",
-        "default": ["帮我", "怎么办", "求助", "请问"],
-        "description": "静态关键词列表"
-      },
-      "dynamic_generation": {
-        "type": "bool",
-        "default": true,
-        "description": "启用动态关键词生成"
-      },
-      "dynamic_refresh_interval_minutes": {
-        "type": "int",
-        "default": 60,
-        "description": "动态关键词刷新间隔（分钟）"
-      },
-      "validation_mode": {
-        "type": "string",
-        "default": "llm",
-        "description": "验证模式：rule / llm",
-        "enum": ["rule", "llm"]
-      },
-      "validation_threshold": {
-        "type": "float",
-        "default": 0.7,
-        "description": "LLM 验证置信度阈值"
-      },
-      "llm_provider_id": {
-        "type": "string",
-        "default": "",
-        "description": "关键词验证使用的 LLM Provider ID（留空使用默认）"
-      },
-      "max_keywords_per_group": {
-        "type": "int",
-        "default": 20,
-        "description": "每群最大关键词数"
-      },
-      "force_reply_keywords": {
-        "type": "list",
-        "default": [],
-        "description": "强制回复关键词列表（命中时100%回复，跳过LLM验证）"
-      }
-    }
+  "provider_id": {
+    "type": "string",
+    "default": "",
+    "description": "指定LLM提供商ID，留空则使用当前会话默认提供商",
+    "_special": "select_provider"
   },
-  "memory": {
-    "type": "object",
-    "description": "Memory 集成配置",
-    "items": {
-      "integration_mode": {
-        "type": "string",
-        "default": "auto",
-        "description": "Memory 集成模式：auto(自动检测) / off(关闭)",
-        "enum": ["auto", "off"]
-      },
-      "fallback_on_unavailable": {
-        "type": "bool",
-        "default": true,
-        "description": "tier_memory 不可用时是否降级运行"
-      },
-      "max_context_messages": {
-        "type": "int",
-        "default": 10,
-        "description": "最大上下文消息数"
-      },
-      "max_memory_results": {
-        "type": "int",
-        "default": 5,
-        "description": "最大记忆检索结果数"
-      },
-      "max_knowledge_facts": {
-        "type": "int",
-        "default": 3,
-        "description": "最大知识图谱事实数"
-      }
-    }
+  "followup_enabled": {
+    "type": "bool",
+    "default": true,
+    "description": "跟进回复开关。开启后，Bot主动回复后会监听用户后续发言，判断是否需要继续跟进"
   },
-  "cooldown": {
-    "type": "object",
-    "description": "冷却时间配置",
-    "items": {
-      "default_seconds": {
-        "type": "int",
-        "default": 300,
-        "description": "默认冷却时间（秒）"
-      }
-    }
+  "quiet_hours_enabled": {
+    "type": "bool",
+    "default": false,
+    "description": "静音时段开关。开启后在指定时段内不发送主动回复"
+  },
+  "quiet_hours_start": {
+    "type": "string",
+    "default": "23:00",
+    "description": "静音时段开始时间（格式 HH:MM），仅在静音时段开关开启时生效"
+  },
+  "quiet_hours_end": {
+    "type": "string",
+    "default": "07:00",
+    "description": "静音时段结束时间（格式 HH:MM），仅在静音时段开关开启时生效"
+  },
+  "cooperation_context_enabled": {
+    "type": "bool",
+    "default": true,
+    "description": "上下文协作开关。开启后从iris_chat_memory获取群聊近期消息（L1缓冲）和长期记忆（L2检索），用于丰富回复上下文"
+  },
+  "cooperation_profile_enabled": {
+    "type": "bool",
+    "default": true,
+    "description": "画像协作开关。开启后从iris_chat_memory获取用户/群聊画像，用于个性化回复"
+  },
+  "cooperation_llm_confirm_enabled": {
+    "type": "bool",
+    "default": true,
+    "description": "LLM确认协作开关。开启后在hybrid模式下由LLM二次确认是否应该主动回复"
+  },
+  "cooperation_llm_followup_enabled": {
+    "type": "bool",
+    "default": true,
+    "description": "LLM跟进决策协作开关。开启后由LLM判断是否需要跟进回复"
   }
 }

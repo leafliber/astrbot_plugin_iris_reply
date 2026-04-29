@@ -1,400 +1,287 @@
 from __future__ import annotations
 
-import asyncio
-import logging
-import os
-import sys
-from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List
 
-plugin_root = Path(__file__).parent
-if str(plugin_root) not in sys.path:
-    sys.path.insert(0, str(plugin_root))
-
-from astrbot.api.star import Star, Context
+from astrbot.api import logger
 from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
+from astrbot.api.star import Context, Star, register
 
-from iris_reply.config.config import ReplyConfig
-from iris_reply.core.memory_api import MemoryAPI
-from iris_reply.core.llm_client import LLMClient
-from iris_reply.core.message_builder import MessageBuilder
-from iris_reply.core.reply_sender import ReplySender
-from iris_reply.storage.store import Store
-from iris_reply.models.models import FollowupPlan, KeywordSource
-from iris_reply.utils.cooldown import CooldownManager
-from iris_reply.utils.rate_limiter import RateLimiter
-from iris_reply.keyword.keyword_store import KeywordStore
-from iris_reply.keyword.keyword_matcher import KeywordMatcher
-from iris_reply.keyword.keyword_validator import KeywordValidator
-from iris_reply.keyword.keyword_generator import KeywordGenerator
-from iris_reply.proactive.analyzer import MessageAnalyzer
-from iris_reply.proactive.decision_engine import DecisionEngine
-from iris_reply.proactive.context_assembler import ContextAssembler
-from iris_reply.followup.followup_planner import FollowupPlanner
-from iris_reply.followup.followup_scheduler import FollowupScheduler
-from iris_reply.followup.followup_executor import FollowupExecutor
-from iris_reply.commands.handler import CommandHandler
-
-logger = logging.getLogger("iris_reply")
+from iris_reply.cooldown import parse_duration
+from iris_reply.manager import ReplyManager
 
 
-class IrisReply(Star):
-    def __init__(self, context: Context):
+@register("iris_reply", "Cassia", "主动回复插件 - 信号检测与智能跟进", "1.0.0")
+class IrisReplyPlugin(Star):
+    def __init__(self, context: Context) -> None:
         super().__init__(context)
-        self._config = ReplyConfig(context)
+        config = self._load_config()
+        self._manager = ReplyManager(context, config)
+        self._bot_id: str = ""
 
-        data_dir = os.path.join(get_astrbot_plugin_data_path(), "iris_reply")
-        os.makedirs(data_dir, exist_ok=True)
-
-        self._store = Store(data_dir)
-        self._memory_api = MemoryAPI()
-        self._llm_client = LLMClient(context)
-        self._message_builder = MessageBuilder()
-        self._reply_sender = ReplySender(context, self._memory_api)
-
-        self._cooldown = CooldownManager(
-            default_seconds=self._config.cooldown.get("default_seconds", 300)
-        )
-        self._rate_limiter = RateLimiter(
-            max_per_hour=self._config.proactive.get("max_replies_per_hour", 3)
-        )
-
-        self._keyword_store = KeywordStore(
-            self._store,
-            global_static_keywords=self._config.keyword.get("static_keywords", []),
-        )
-        self._keyword_matcher = KeywordMatcher()
-        self._keyword_validator = KeywordValidator(
-            self._llm_client, self._message_builder, self._memory_api, self._config
-        )
-        self._keyword_generator: KeywordGenerator | None = None
-        if self._config.keyword.get("dynamic_generation", True):
-            self._keyword_generator = KeywordGenerator(
-                self._llm_client, self._message_builder, self._memory_api, self._config
-            )
-
-        self._analyzer = MessageAnalyzer(self._llm_client, self._memory_api, self._config)
-        self._decision_engine = DecisionEngine(
-            self._llm_client, self._message_builder, self._memory_api, self._config
-        )
-        self._context_assembler = ContextAssembler(self._memory_api, self._config)
-
-        self._followup_planner = FollowupPlanner(
-            self._llm_client, self._message_builder, self._memory_api, self._config
-        )
-        self._followup_scheduler = FollowupScheduler(self._store, self._config)
-        self._followup_executor = FollowupExecutor(
-            self._llm_client, self._message_builder, self._memory_api,
-            self._reply_sender, self._cooldown, self._config,
-        )
-
-        self._followup_scheduler.set_execute_callback(self._execute_followup)
-
-        self._command_handler = CommandHandler(
-            context, self._store, self._keyword_store, self._keyword_generator
-        )
-
-        self._last_bot_reply: dict[str, str] = {}
-        self._keyword_refresh_task: asyncio.Task | None = None
+    def _load_config(self) -> Dict[str, Any]:
+        config: Dict[str, Any] = {}
+        for key in (
+            "proactive_enabled",
+            "proactive_mode",
+            "provider_id",
+            "followup_enabled",
+            "quiet_hours_enabled",
+            "quiet_hours_start",
+            "quiet_hours_end",
+            "cooperation_context_enabled",
+            "cooperation_profile_enabled",
+            "cooperation_llm_confirm_enabled",
+            "cooperation_llm_followup_enabled",
+        ):
+            try:
+                value = self.context.get_config(key)
+                if value is not None:
+                    config[key] = value
+            except Exception as e:
+                logger.debug(f"Config load skip '{key}': {e}")
+        return config
 
     async def initialize(self) -> None:
-        self._bind_tier_memory()
-        self._load_group_cooldowns()
-
-        if self._config.keyword.get("dynamic_generation", True) and self._keyword_generator:
-            interval = self._config.keyword.get("dynamic_refresh_interval_minutes", 60)
-            self._keyword_refresh_task = asyncio.create_task(
-                self._periodic_keyword_refresh(interval)
-            )
-
-        logger.info("Iris Reply 初始化完成")
-
-    async def terminate(self) -> None:
-        if self._keyword_refresh_task and not self._keyword_refresh_task.done():
-            self._keyword_refresh_task.cancel()
-            try:
-                await self._keyword_refresh_task
-            except asyncio.CancelledError:
-                pass
-
-        await self._followup_scheduler.shutdown()
-        self._store.close()
-        logger.info("Iris Reply 已终止")
-
-    def _bind_tier_memory(self) -> None:
-        integration_mode = self._config.memory.get("integration_mode", "auto")
-        if integration_mode == "off":
-            logger.info("Memory 集成已关闭")
-            return
-
+        await self._manager.initialize()
         try:
-            from iris_memory.core.components import get_component_manager
-            cm = get_component_manager()
-            if cm is not None:
-                self._memory_api.bind(cm)
-                logger.info("已绑定 tier_memory ComponentManager")
-            else:
-                logger.info("tier_memory ComponentManager 不可用，降级运行")
-        except ImportError:
-            logger.info("iris_memory 未安装，降级运行")
-        except Exception as e:
-            logger.warning("绑定 tier_memory 失败: %s，降级运行", e)
+            platforms = self.context.get_platforms()
+            for platform in platforms:
+                if hasattr(platform, "bot") and hasattr(platform.bot, "self_id"):
+                    self._bot_id = str(platform.bot.self_id)
+                    break
+        except Exception:
+            pass
+        logger.info("IrisReplyPlugin initialized")
 
-    def _load_group_cooldowns(self) -> None:
-        groups = self._store.get_all_enabled_groups()
-        for g in groups:
-            self._cooldown.set_group_cooldown(g.group_id, g.cooldown_seconds)
-
-    @filter.event_message_type(filter.EventMessageType.ALL)
-    async def on_message(self, event: AstrMessageEvent):
-        group_id = self._get_group_id(event)
-        if not group_id:
-            return
-
-        self._reply_sender.register_session(group_id, event.unified_msg_origin)
-
-        user_id = self._get_user_id(event)
-        message = event.message_str
-
-        if not message:
-            return
-
-        if self._is_bot_message(event):
-            return
-
-        self._followup_scheduler.on_new_message(group_id)
-
-        keyword_enabled = self._config.keyword.get("enable", True)
-        if keyword_enabled:
-            force_triggered = await self._handle_keyword(event, group_id, user_id, message)
-            if force_triggered:
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def on_group_message(self, event: AstrMessageEvent):
+        '''监听群聊消息，用于信号检测和跟进回复'''
+        try:
+            text = event.message_str
+            if not text:
                 return
 
-        if getattr(event, "is_at_or_wake_command", False):
-            return
+            if text.lstrip().startswith("/"):
+                return
 
-        proactive_enabled = self._config.proactive.get("enable", False)
-        group_config = self._store.get_group_config(group_id)
-        if proactive_enabled and group_config.proactive_enabled:
-            await self._handle_proactive(event, group_id, user_id, message)
-        yield
+            message_obj = event.message_obj
+            sender = message_obj.sender
+            user_id = str(sender.user_id) if hasattr(sender, "user_id") else ""
 
-    @filter.on_llm_response()
-    async def on_llm_response(self, event: AstrMessageEvent, response: Any) -> None:
-        group_id = self._get_group_id(event)
-        if not group_id:
-            return
+            group_id = ""
+            if hasattr(message_obj, "group_id") and message_obj.group_id:
+                group_id = str(message_obj.group_id)
+            if not group_id:
+                return
 
-        followup_enabled = self._config.followup.get("enable", False)
-        if not followup_enabled:
-            return
+            session_key = ""
+            if hasattr(event, "session_id"):
+                session_key = event.session_id or ""
 
-        group_config = self._store.get_group_config(group_id)
-        if not group_config.followup_enabled:
-            return
+            umo = event.unified_msg_origin
+            self._manager.store_umo(group_id, umo)
 
-        resp_text = ""
-        if response is not None:
-            if hasattr(response, "completion_text"):
-                resp_text = str(response.completion_text).strip()
-            elif hasattr(response, "completion"):
-                resp_text = str(response.completion).strip()
-            elif isinstance(response, str):
-                resp_text = response.strip()
-        if not resp_text:
-            return
+            is_bot = user_id == self._bot_id
 
-        self._last_bot_reply[group_id] = resp_text
+            sender_name = ""
+            if hasattr(sender, "nickname"):
+                sender_name = sender.nickname or ""
+            elif hasattr(sender, "name"):
+                sender_name = sender.name or ""
 
-        follow_all = self._config.followup.get("followup_after_all_replies", False)
-        if not follow_all:
-            return
-
-        asyncio.create_task(self._plan_followup(group_id, resp_text))
+            await self._manager.on_message(
+                text=text,
+                user_id=user_id,
+                group_id=group_id,
+                session_key=session_key,
+                is_bot=is_bot,
+                sender_name=sender_name,
+            )
+        except Exception as e:
+            logger.error(f"Error processing message in IrisReplyPlugin: {e}")
 
     @filter.command("iris_reply")
-    async def handle_command(self, event: AstrMessageEvent) -> None:
-        message = event.message_str.strip()
-        parts = message.split()
-        args = parts[1:] if len(parts) > 1 else []
-        result = await self._command_handler.handle(event, args)
-        yield event.plain_result(result)
+    async def cmd_iris_reply(self, event: AstrMessageEvent):
+        '''Iris Reply 主动回复插件管理指令'''
+        raw = event.message_str.strip()
+        parts = [p for p in raw.split() if p and not p.startswith("/")]
+        sub = parts[0].lower() if parts else ""
 
-    async def _handle_keyword(
-        self, event: AstrMessageEvent, group_id: str, user_id: str, message: str
-    ) -> bool:
-        if self._cooldown.is_on_cooldown(group_id):
-            return False
-
-        force_keywords = self._config.keyword.get("force_reply_keywords", [])
-        if force_keywords:
-            message_lower = message.lower()
-            for fk in force_keywords:
-                if fk.lower() in message_lower:
-                    logger.info("命中强制回复关键词: %s，走 AstrBot 原生回复流程", fk)
-                    event.is_at_or_wake_command = True
-                    return True
-
-        static_keywords = self._keyword_store.get_static_keywords(group_id)
-        dynamic_keywords = self._keyword_store.get_dynamic_keywords(group_id)
-        if not static_keywords and not dynamic_keywords:
-            return False
-
-        matches = []
-        if static_keywords:
-            matches.extend(self._keyword_matcher.match(message, static_keywords, KeywordSource.STATIC))
-        if dynamic_keywords:
-            matches.extend(self._keyword_matcher.match(message, dynamic_keywords, KeywordSource.DYNAMIC))
-        if not matches:
-            return False
-
-        matches.sort(key=lambda m: m.confidence, reverse=True)
-        best_match = matches[0]
-
-        validation = await self._keyword_validator.validate(
-            best_match, message, group_id, user_id
-        )
-
-        if not validation.should_reply:
-            logger.debug(
-                "关键词 '%s' 命中但验证不通过: %s",
-                best_match.keyword, validation.reason,
+        if sub in ("", "help", "帮助"):
+            yield event.plain_result(
+                "Iris Reply 指令帮助:\n"
+                "  /iris_reply status          - 查看插件运行状态\n"
+                "  /iris_reply toggle [on|off] - 开关主动回复\n"
+                "  /iris_reply mode [rule|hybrid] - 查看/切换决策模式\n"
+                "  /iris_reply cooldown <on|off|status> [群号] [时长] - 冷却管理\n"
+                "  /iris_reply followup [on|off]   - 开关跟进回复\n"
+                "  /iris_reply quiet <on|off> [开始] [结束] - 静音时段\n"
+                "\n"
+                "冷却时长格式: 30m / 2h\n"
+                "静音时间格式: HH:MM（如 23:00 07:00）"
             )
-            return False
-
-        direction = validation.reply_direction or f"用户消息涉及 '{best_match.keyword}'"
-        context = await self._context_assembler.assemble(group_id, user_id, best_match.keyword)
-
-        system_prompt, prompt = self._message_builder.build_keyword_reply_prompt(
-            best_match, message, context, direction
-        )
-        provider_id = self._config.keyword.get("llm_provider_id", "")
-        reply = await self._llm_client.generate(
-            prompt, system_prompt, provider_id, module="keyword_reply"
-        )
-
-        if not reply:
-            return False
-
-        success = await self._reply_sender.send_group_message(group_id, reply)
-        if success:
-            self._cooldown.mark_reply(group_id)
-            self._store.record_reply(
-                group_id, "keyword", best_match.keyword, validation.confidence
+        elif sub == "status":
+            yield event.plain_result(self._format_status())
+        elif sub == "toggle":
+            yield event.plain_result(self._handle_toggle(parts[1:]))
+        elif sub == "mode":
+            yield event.plain_result(self._handle_mode(parts[1:]))
+        elif sub == "cooldown":
+            yield event.plain_result(self._handle_cooldown(event, parts[1:]))
+        elif sub == "followup":
+            yield event.plain_result(self._handle_followup(parts[1:]))
+        elif sub == "quiet":
+            yield event.plain_result(self._handle_quiet(parts[1:]))
+        else:
+            yield event.plain_result(
+                f"未知子命令: {sub}\n使用 /iris_reply help 查看帮助"
             )
-            self._last_bot_reply[group_id] = reply
-            await self._plan_followup(group_id, reply)
-            return True
 
-        return False
-
-    async def _handle_proactive(
-        self, event: AstrMessageEvent, group_id: str, user_id: str, message: str
-    ) -> None:
-        if self._cooldown.is_on_cooldown(group_id):
-            return
-
-        if not self._rate_limiter.is_allowed(group_id):
-            return
-
-        recent = await self._memory_api.get_recent_context(
-            group_id, self._config.proactive.get("analysis_window_messages", 10)
-        )
-        if not recent:
-            current_msg = {
-                "role": "user",
-                "content": message,
-                "sender_id": user_id,
-            }
-            recent = [current_msg]
-
-        analysis = await self._analyzer.analyze(recent, group_id)
-
-        if not analysis.should_consider:
-            return
-
-        decision = await self._decision_engine.decide(analysis, group_id, user_id)
-
-        if not decision.should_reply:
-            return
-
-        direction = decision.reply_direction or analysis.summary
-        reply = await self._decision_engine.generate_reply(
-            analysis, group_id, user_id, direction
+    def _format_status(self) -> str:
+        status = self._manager.status
+        return (
+            f"Iris Reply 状态:\n"
+            f"  主动回复: {'✅ 开启' if status.get('proactive_enabled') else '❌ 关闭'}\n"
+            f"  决策模式: {status.get('proactive_mode', 'rule')}\n"
+            f"  跟进回复: {'✅ 开启' if status.get('followup_enabled') else '❌ 关闭'}\n"
+            f"  静音时段: {'✅ 开启' if status.get('quiet_hours_enabled') else '❌ 关闭'}\n"
+            f"  信号队列: {status.get('signal_queue_total', 0)} 个信号 / "
+            f"{status.get('signal_queue_groups', 0)} 个群\n"
+            f"  活跃调度器: {status.get('scheduler_active_groups', 0)} 个群\n"
+            f"  冷却中: {status.get('cooldown_active_groups', 0)} 个群\n"
+            f"  跟进窗口: {status.get('followup_active_expectations', 0)} 个"
         )
 
-        if not reply:
-            return
+    def _handle_toggle(self, args: List[str]) -> str:
+        if not args:
+            current = self._manager.get_config("proactive_enabled", True)
+            new_state = not current
+            self._manager.update_config("proactive_enabled", new_state)
+            return f"主动回复已{'开启' if new_state else '关闭'}"
 
-        success = await self._reply_sender.send_group_message(group_id, reply)
-        if success:
-            self._cooldown.mark_reply(group_id)
-            self._rate_limiter.record(group_id)
-            self._store.record_reply(
-                group_id, "proactive", None, decision.confidence
+        target = args[0].lower()
+        if target in ("on", "开", "开启"):
+            self._manager.update_config("proactive_enabled", True)
+            return "主动回复已开启"
+        elif target in ("off", "关", "关闭"):
+            self._manager.update_config("proactive_enabled", False)
+            return "主动回复已关闭"
+        else:
+            return "用法: /iris_reply toggle [on|off]"
+
+    def _handle_mode(self, args: List[str]) -> str:
+        if not args:
+            current = self._manager.get_config("proactive_mode", "rule")
+            return (
+                f"当前模式: {current}\n可选模式: rule (纯规则), hybrid (规则+LLM确认)"
             )
-            self._last_bot_reply[group_id] = reply
 
-            followup_enabled = self._config.followup.get("enable", False)
-            group_config = self._store.get_group_config(group_id)
-            if followup_enabled and group_config.followup_enabled:
-                await self._plan_followup(group_id, reply)
+        mode = args[0].lower()
+        if mode in ("rule", "规则"):
+            self._manager.update_config("proactive_mode", "rule")
+            return "已切换到纯规则模式"
+        elif mode in ("hybrid", "混合"):
+            self._manager.update_config("proactive_mode", "hybrid")
+            return "已切换到混合模式 (规则+LLM确认)"
+        else:
+            return "未知模式，可选: rule, hybrid"
 
-    async def _plan_followup(self, group_id: str, bot_reply: str) -> None:
-        plan = await self._followup_planner.plan(group_id, bot_reply)
-        if plan is None or not plan.should_followup:
-            return
+    def _handle_cooldown(self, event: AstrMessageEvent, args: List[str]) -> str:
+        if not args:
+            return (
+                "用法: /iris_reply cooldown <on|off|status> [群号] [时长]\n"
+                "  on [群号] [时长] - 开启冷却（时长如 30m, 2h）\n"
+                "  off [群号] - 关闭冷却\n"
+                "  status [群号] - 查看冷却状态"
+            )
 
-        await self._followup_scheduler.schedule(group_id, plan)
+        action = args[0].lower()
+        group_id = args[1] if len(args) > 1 else self._get_current_group_id(event)
 
-    async def _execute_followup(self, group_id: str, plan: FollowupPlan) -> None:
-        bot_reply = self._last_bot_reply.get(group_id, "")
-        await self._followup_executor.execute(group_id, plan, bot_reply)
+        if not group_id:
+            return "无法确定群号，请指定群号"
 
-    async def _periodic_keyword_refresh(self, interval_minutes: int) -> None:
-        while True:
-            try:
-                await asyncio.sleep(interval_minutes * 60)
-                groups = self._store.get_all_enabled_groups()
-                for group in groups:
-                    try:
-                        existing = self._keyword_store.get_all_keywords(group.group_id)
-                        keywords = await self._keyword_generator.refresh_all(
-                            group.group_id, existing
-                        )
-                        self._keyword_store.update_dynamic_keywords(group.group_id, keywords)
-                    except Exception as e:
-                        logger.error("群 %s 动态关键词刷新失败: %s", group.group_id, e)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error("动态关键词刷新任务异常: %s", e)
+        if action == "on":
+            duration_str = args[2] if len(args) > 2 else None
+            duration_minutes = parse_duration(duration_str) if duration_str else None
+            return self._manager.activate_cooldown(
+                group_id=group_id,
+                duration_minutes=duration_minutes,
+                initiated_by="user",
+            )
 
-    def _get_group_id(self, event: AstrMessageEvent) -> str:
+        elif action == "off":
+            return self._manager.deactivate_cooldown(group_id)
+
+        elif action == "status":
+            status = self._manager.get_cooldown_status(group_id)
+            if status is None:
+                return f"群 {group_id} 无冷却记录"
+            active = "✅ 激活" if status["is_active"] else "❌ 未激活"
+            return (
+                f"群 {group_id} 冷却状态: {active}\n"
+                f"开始时间: {status['started_at']}\n"
+                f"到期时间: {status['expires_at']}\n"
+                f"发起方: {status['initiated_by']}\n"
+                f"原因: {status.get('reason', '无')}"
+            )
+        else:
+            return "未知操作，请使用 on/off/status"
+
+    def _handle_followup(self, args: List[str]) -> str:
+        if not args:
+            current = self._manager.get_config("followup_enabled", True)
+            state_text = "开启" if current else "关闭"
+            return (
+                f"跟进回复当前: {state_text}\n用法: /iris_reply followup <on|off>"
+            )
+
+        target = args[0].lower()
+        if target in ("on", "开", "开启"):
+            self._manager.update_config("followup_enabled", True)
+            return "跟进回复已开启"
+        elif target in ("off", "关", "关闭"):
+            self._manager.update_config("followup_enabled", False)
+            return "跟进回复已关闭"
+        else:
+            return "用法: /iris_reply followup <on|off>"
+
+    def _handle_quiet(self, args: List[str]) -> str:
+        if not args:
+            enabled = self._manager.get_config("quiet_hours_enabled", False)
+            start = self._manager.get_config("quiet_hours_start", "23:00")
+            end = self._manager.get_config("quiet_hours_end", "07:00")
+            state_text = "开启" if enabled else "关闭"
+            return (
+                f"静音时段: {state_text}\n时段: {start} - {end}\n"
+                "用法: /iris_reply quiet <on|off> [开始时间] [结束时间]\n"
+                "示例: /iris_reply quiet on 23:00 07:00"
+            )
+
+        action = args[0].lower()
+        if action in ("on", "开", "开启"):
+            start = args[1] if len(args) > 1 else "23:00"
+            end = args[2] if len(args) > 2 else "07:00"
+            self._manager.update_config("quiet_hours_enabled", True)
+            self._manager.update_config("quiet_hours_start", start)
+            self._manager.update_config("quiet_hours_end", end)
+            return f"静音时段已开启: {start} - {end}"
+        elif action in ("off", "关", "关闭"):
+            self._manager.update_config("quiet_hours_enabled", False)
+            return "静音时段已关闭"
+        else:
+            return "用法: /iris_reply quiet <on|off> [开始] [结束]"
+
+    def _get_current_group_id(self, event: AstrMessageEvent) -> str:
         try:
-            gid = event.get_group_id()
-            if gid:
-                return str(gid)
+            message_obj = event.message_obj
+            if hasattr(message_obj, "group_id") and message_obj.group_id:
+                return str(message_obj.group_id)
         except Exception:
             pass
         return ""
 
-    def _get_user_id(self, event: AstrMessageEvent) -> str:
-        try:
-            uid = event.get_sender_id()
-            if uid:
-                return str(uid)
-        except Exception:
-            pass
-        return ""
-
-    def _is_bot_message(self, event: AstrMessageEvent) -> bool:
-        try:
-            self_id = event.get_self_id()
-            sender_id = event.get_sender_id()
-            if self_id and sender_id and str(self_id) == str(sender_id):
-                return True
-        except Exception:
-            pass
-        return False
+    async def terminate(self):
+        '''插件卸载/停用时调用，清理资源'''
+        await self._manager.close()
+        logger.info("IrisReplyPlugin terminated")
