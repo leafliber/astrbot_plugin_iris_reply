@@ -224,6 +224,9 @@ class IrisReply(Star):
             self._iris_context[group_id] = context_text
             self._iris_active.add(group_id)
             event.is_at_or_wake_command = True
+            provider_id = self._config.provider_id
+            if provider_id:
+                event.set_extra("selected_provider", provider_id)
             self._tool_ctx.set_context(group_id)
             logger.info(f"Iris Reply: triggered ({trigger_reason}) for group {group_id}")
 

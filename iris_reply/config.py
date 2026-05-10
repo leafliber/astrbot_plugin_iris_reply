@@ -21,6 +21,7 @@ _DEFAULTS = {
     "max_token": 3000,
     "follow_up_ttl": 30,
     "quality_threshold": 0.3,
+    "provider_id": "",
     "whitelist": [],
 }
 
@@ -86,6 +87,10 @@ class ConfigManager:
     @property
     def quality_threshold(self) -> float:
         return max(0.0, min(1.0, float(self._get("quality_threshold", 0.3))))
+
+    @property
+    def provider_id(self) -> str:
+        return str(self._get("provider_id", ""))
 
     @property
     def whitelist(self) -> list[str]:
