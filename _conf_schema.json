@@ -12,7 +12,7 @@
       "start_hour": {
         "description": "开始时间（小时，0-23）",
         "type": "int",
-        "default": 23,
+        "default": 1,
         "hint": "24小时制，如 23 表示晚上11点"
       },
       "start_minute": {
@@ -48,13 +48,13 @@
   "default_n": {
     "description": "默认消息计数阈值 N",
     "type": "int",
-    "default": 15,
+    "default": 30,
     "hint": "每收到 N 条有效消息触发一次采样，范围 5-120"
   },
   "default_t": {
     "description": "默认时间间隔阈值 T（分钟）",
     "type": "int",
-    "default": 30,
+    "default": 65,
     "hint": "距上次采样超过 T 分钟且有新消息时触发，范围 5-180"
   },
   "max_token": {
@@ -66,7 +66,7 @@
   "follow_up_ttl": {
     "description": "跟进注册表默认 TTL（分钟）",
     "type": "int",
-    "default": 30,
+    "default": 5,
     "hint": "动态跟进记录的存活时长，范围 5-120"
   },
   "quality_threshold": {
