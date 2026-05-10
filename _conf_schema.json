@@ -1,59 +1,84 @@
 {
-  "proactive_enabled": {
+  "enabled": {
+    "description": "启用 Iris Reply 插件",
     "type": "bool",
-    "default": true,
-    "description": "主动回复总开关。关闭后插件不再主动发送任何消息，仅响应 /iris_reply 指令"
+    "default": true
   },
-  "proactive_mode": {
-    "type": "string",
-    "default": "rule",
-    "description": "决策模式。rule：纯规则判断，信号权重达到直接回复阈值即回复；hybrid：规则+LLM确认，权重在两阈值之间时由LLM二次确认是否回复",
-    "options": ["rule", "hybrid"]
+  "mute_period": {
+    "description": "静音时段",
+    "type": "object",
+    "hint": "在静音时段内，Iris 不会主动触发任何回复",
+    "items": {
+      "start_hour": {
+        "description": "开始时间（小时，0-23）",
+        "type": "int",
+        "default": 23,
+        "hint": "24小时制，如 23 表示晚上11点"
+      },
+      "start_minute": {
+        "description": "开始时间（分钟，0-59）",
+        "type": "int",
+        "default": 0
+      },
+      "end_hour": {
+        "description": "结束时间（小时，0-23）",
+        "type": "int",
+        "default": 7,
+        "hint": "24小时制，如 7 表示早上7点"
+      },
+      "end_minute": {
+        "description": "结束时间（分钟，0-59）",
+        "type": "int",
+        "default": 0
+      }
+    }
   },
-  "provider_id": {
-    "type": "string",
-    "default": "",
-    "description": "指定LLM提供商ID，留空则使用当前会话默认提供商",
-    "_special": "select_provider"
+  "window_size": {
+    "description": "滑动记忆窗口大小（条数）",
+    "type": "int",
+    "default": 10,
+    "hint": "保留最近 N 条有效发言，范围 5-30"
   },
-  "followup_enabled": {
-    "type": "bool",
-    "default": true,
-    "description": "跟进回复开关。开启后，Bot主动回复后会监听用户后续发言，判断是否需要继续跟进"
+  "system_prompt_template": {
+    "description": "Iris 专属人设模板",
+    "type": "text",
+    "default": "你正在观察一个群聊。不介入是常态，介入才是例外。若不需回复请调用 skip_reply，若需回复则按需选用以下工具。",
+    "hint": "当 Iris 触发 LLM 时，此模板会注入到 extra_user_content_parts 中"
   },
-  "quiet_hours_enabled": {
-    "type": "bool",
-    "default": false,
-    "description": "静音时段开关。开启后在指定时段内不发送主动回复"
+  "default_n": {
+    "description": "默认消息计数阈值 N",
+    "type": "int",
+    "default": 15,
+    "hint": "每收到 N 条有效消息触发一次采样，范围 5-120"
   },
-  "quiet_hours_start": {
-    "type": "string",
-    "default": "23:00",
-    "description": "静音时段开始时间（格式 HH:MM），仅在静音时段开关开启时生效"
+  "default_t": {
+    "description": "默认时间间隔阈值 T（分钟）",
+    "type": "int",
+    "default": 30,
+    "hint": "距上次采样超过 T 分钟且有新消息时触发，范围 5-180"
   },
-  "quiet_hours_end": {
-    "type": "string",
-    "default": "07:00",
-    "description": "静音时段结束时间（格式 HH:MM），仅在静音时段开关开启时生效"
+  "max_token": {
+    "description": "上下文 token 上限",
+    "type": "int",
+    "default": 3000,
+    "hint": "提交给 LLM 的上下文最大 token 数，范围 1000-8000"
   },
-  "cooperation_context_enabled": {
-    "type": "bool",
-    "default": true,
-    "description": "上下文协作开关。开启后从iris_chat_memory获取群聊近期消息（L1缓冲）和长期记忆（L2检索），用于丰富回复上下文"
+  "follow_up_ttl": {
+    "description": "跟进注册表默认 TTL（分钟）",
+    "type": "int",
+    "default": 30,
+    "hint": "动态跟进记录的存活时长，范围 5-120"
   },
-  "cooperation_profile_enabled": {
-    "type": "bool",
-    "default": true,
-    "description": "画像协作开关。开启后从iris_chat_memory获取用户/群聊画像，用于个性化回复"
+  "quality_threshold": {
+    "description": "消息质量评分阈值",
+    "type": "float",
+    "default": 0.3,
+    "hint": "低于此阈值的消息不进入滑动窗口，范围 0.0-1.0"
   },
-  "cooperation_llm_confirm_enabled": {
-    "type": "bool",
-    "default": true,
-    "description": "LLM确认协作开关。开启后在hybrid模式下由LLM二次确认是否应该主动回复"
-  },
-  "cooperation_llm_followup_enabled": {
-    "type": "bool",
-    "default": true,
-    "description": "LLM跟进决策协作开关。开启后由LLM判断是否需要跟进回复"
+  "whitelist": {
+    "description": "白名单群组 ID 列表",
+    "type": "list",
+    "default": [],
+    "hint": "为空则不启用任何群的触发。使用 /iris_reply status 获取群 ID"
   }
 }

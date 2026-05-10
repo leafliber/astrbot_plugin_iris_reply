@@ -1,0 +1,341 @@
+from __future__ import annotations
+
+import asyncio
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any
+
+from astrbot.api import logger
+
+from .config import ConfigManager
+
+
+class GroupState(Enum):
+    IDLE = "idle"
+    COOLDOWN = "cooldown"
+    FOLLOWING = "following"
+    MUTED = "muted"
+
+
+@dataclass
+class FollowUpEntry:
+    user_ids: set[str] = field(default_factory=set)
+    keywords: list[str] = field(default_factory=list)
+    user_ttls: dict[str, float] = field(default_factory=dict)
+    keyword_ttls: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
+class GroupStateData:
+    state: GroupState = GroupState.IDLE
+    cooldown_until: float = 0.0
+    following_since: float = 0.0
+    msg_count: int = 0
+    last_sample_time: float = 0.0
+    backoff_multiplier: int = 1
+    auto_adjust_factor: float = 1.0
+    consecutive_replies: int = 0
+    skip_history: deque = field(default_factory=lambda: deque(maxlen=20))
+    follow_up: FollowUpEntry = field(default_factory=FollowUpEntry)
+    dirty: bool = False
+
+
+class StateManager:
+    N_MAX = 120
+
+    def __init__(self, config: ConfigManager) -> None:
+        self._config = config
+        self._groups: dict[str, GroupStateData] = {}
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._dirty_groups: set[str] = set()
+        self._global_lock = asyncio.Lock()
+
+    def get_lock(self, group_id: str) -> asyncio.Lock:
+        if group_id not in self._locks:
+            self._locks[group_id] = asyncio.Lock()
+        return self._locks[group_id]
+
+    def _ensure_group(self, group_id: str) -> GroupStateData:
+        if group_id not in self._groups:
+            self._groups[group_id] = GroupStateData(
+                last_sample_time=time.time(),
+            )
+        return self._groups[group_id]
+
+    def get_state(self, group_id: str) -> GroupStateData:
+        data = self._ensure_group(group_id)
+        now = time.time()
+        if data.state == GroupState.COOLDOWN and now >= data.cooldown_until:
+            data.state = GroupState.IDLE
+            data.dirty = True
+            self._dirty_groups.add(group_id)
+        if data.state == GroupState.FOLLOWING:
+            self._cleanup_expired_follow(group_id, data, now)
+            if not data.follow_up.user_ids and not data.follow_up.keywords:
+                data.state = GroupState.IDLE
+                data.dirty = True
+                self._dirty_groups.add(group_id)
+        return data
+
+    def is_muted(self) -> bool:
+        now = time.localtime()
+        current_mins = now.tm_hour * 60 + now.tm_min
+        start_mins = self._config.mute_start_hour * 60 + self._config.mute_start_minute
+        end_mins = self._config.mute_end_hour * 60 + self._config.mute_end_minute
+        if start_mins <= end_mins:
+            return start_mins <= current_mins < end_mins
+        return current_mins >= start_mins or current_mins < end_mins
+
+    def set_cooldown(self, group_id: str, minutes: int) -> None:
+        data = self._ensure_group(group_id)
+        minutes = max(1, min(120, minutes))
+        data.state = GroupState.COOLDOWN
+        data.cooldown_until = time.time() + minutes * 60
+        data.dirty = True
+        self._dirty_groups.add(group_id)
+
+    def add_follow_up(
+        self,
+        group_id: str,
+        user_ids: list[str] | None = None,
+        keywords: list[str] | None = None,
+    ) -> None:
+        data = self._ensure_group(group_id)
+        now = time.time()
+        ttl = self._config.follow_up_ttl * 60
+        if user_ids:
+            for uid in user_ids:
+                data.follow_up.user_ids.add(uid)
+                data.follow_up.user_ttls[uid] = now + ttl
+        if keywords:
+            for kw in keywords:
+                if kw not in data.follow_up.keywords:
+                    data.follow_up.keywords.append(kw)
+                data.follow_up.keyword_ttls[kw] = now + ttl
+        data.state = GroupState.FOLLOWING
+        data.following_since = now
+        data.backoff_multiplier = 1
+        data.auto_adjust_factor = 1.0
+        data.consecutive_replies = 0
+        data.dirty = True
+        self._dirty_groups.add(group_id)
+
+    def remove_follow_up(
+        self,
+        group_id: str,
+        user_ids: list[str] | None = None,
+        keywords: list[str] | None = None,
+    ) -> None:
+        data = self._ensure_group(group_id)
+        if user_ids:
+            for uid in user_ids:
+                data.follow_up.user_ids.discard(uid)
+                data.follow_up.user_ttls.pop(uid, None)
+        if keywords:
+            for kw in keywords:
+                if kw in data.follow_up.keywords:
+                    data.follow_up.keywords.remove(kw)
+                data.follow_up.keyword_ttls.pop(kw, None)
+        if not data.follow_up.user_ids and not data.follow_up.keywords:
+            data.state = GroupState.IDLE
+        data.dirty = True
+        self._dirty_groups.add(group_id)
+
+    def _cleanup_expired_follow(self, group_id: str, data: GroupStateData, now: float) -> None:
+        expired_users = [uid for uid, ttl in data.follow_up.user_ttls.items() if now >= ttl]
+        for uid in expired_users:
+            data.follow_up.user_ids.discard(uid)
+            data.follow_up.user_ttls.pop(uid, None)
+        expired_kw = [kw for kw, ttl in data.follow_up.keyword_ttls.items() if now >= ttl]
+        for kw in expired_kw:
+            if kw in data.follow_up.keywords:
+                data.follow_up.keywords.remove(kw)
+            data.follow_up.keyword_ttls.pop(kw, None)
+        if expired_users or expired_kw:
+            data.dirty = True
+            self._dirty_groups.add(group_id)
+
+    def match_follow_up(self, group_id: str, sender_id: str, message: str) -> bool:
+        data = self.get_state(group_id)
+        if data.state == GroupState.COOLDOWN:
+            return False
+        if sender_id in data.follow_up.user_ids:
+            return True
+        for kw in data.follow_up.keywords:
+            if kw in message:
+                return True
+        return False
+
+    def increment_msg_count(self, group_id: str) -> int:
+        data = self._ensure_group(group_id)
+        data.msg_count += 1
+        data.dirty = True
+        self._dirty_groups.add(group_id)
+        return data.msg_count
+
+    def get_effective_n(self, group_id: str) -> int:
+        data = self._ensure_group(group_id)
+        base_n = self._config.default_n
+        adjusted_n = int(base_n * data.auto_adjust_factor)
+        effective_n = adjusted_n * data.backoff_multiplier
+        return min(effective_n, self.N_MAX)
+
+    def should_trigger_sampling(self, group_id: str) -> bool:
+        data = self.get_state(group_id)
+        if data.state in (GroupState.COOLDOWN, GroupState.MUTED):
+            return False
+        if self.is_muted():
+            return False
+        effective_n = self.get_effective_n(group_id)
+        if data.msg_count >= effective_n:
+            return True
+        elapsed = time.time() - data.last_sample_time
+        if elapsed >= self._config.default_t * 60 and data.msg_count > 0:
+            return True
+        return False
+
+    def reset_sampling(self, group_id: str) -> None:
+        data = self._ensure_group(group_id)
+        data.msg_count = 0
+        data.last_sample_time = time.time()
+        data.dirty = True
+        self._dirty_groups.add(group_id)
+
+    def record_skip_reply(self, group_id: str) -> None:
+        data = self._ensure_group(group_id)
+        data.backoff_multiplier = min(data.backoff_multiplier * 2, self.N_MAX // max(self._config.default_n, 1))
+        data.consecutive_replies = 0
+        data.skip_history.append(time.time())
+        self._check_auto_adjust(group_id, data)
+        data.dirty = True
+        self._dirty_groups.add(group_id)
+
+    def record_actual_reply(self, group_id: str) -> None:
+        data = self._ensure_group(group_id)
+        data.backoff_multiplier = 1
+        data.consecutive_replies += 1
+        if data.consecutive_replies >= 2:
+            data.auto_adjust_factor = 1.0
+            data.consecutive_replies = 0
+        data.dirty = True
+        self._dirty_groups.add(group_id)
+
+    def _check_auto_adjust(self, group_id: str, data: GroupStateData) -> None:
+        now = time.time()
+        one_hour_ago = now - 3600
+        recent_skips = sum(1 for t in data.skip_history if t >= one_hour_ago)
+        if recent_skips >= 3:
+            new_factor = data.auto_adjust_factor * 1.5
+            test_n = int(self._config.default_n * new_factor)
+            if test_n <= self.N_MAX:
+                data.auto_adjust_factor = new_factor
+
+    def reset_group(self, group_id: str) -> None:
+        data = self._ensure_group(group_id)
+        data.msg_count = 0
+        data.last_sample_time = time.time()
+        data.backoff_multiplier = 1
+        data.auto_adjust_factor = 1.0
+        data.consecutive_replies = 0
+        data.skip_history.clear()
+        data.dirty = True
+        self._dirty_groups.add(group_id)
+
+    def mark_dirty(self, group_id: str) -> None:
+        data = self._ensure_group(group_id)
+        data.dirty = True
+        self._dirty_groups.add(group_id)
+
+    async def save_dirty(self, save_fn) -> None:
+        async with self._global_lock:
+            for gid in list(self._dirty_groups):
+                data = self._groups.get(gid)
+                if data and data.dirty:
+                    try:
+                        await save_fn(f"state:{gid}", self._serialize_group(data))
+                        data.dirty = False
+                    except Exception as e:
+                        logger.warning(f"Iris Reply: KV save failed for group {gid}: {e}")
+            self._dirty_groups.clear()
+
+    async def load_all(self, load_fn) -> None:
+        try:
+            all_data = await load_fn("iris_reply:all_groups")
+            if not all_data or not isinstance(all_data, dict):
+                return
+            for gid, gdata in all_data.items():
+                self._groups[gid] = self._deserialize_group(gdata)
+        except Exception as e:
+            logger.warning(f"Iris Reply: KV load failed, running in memory-only mode: {e}")
+
+    async def save_all(self, save_fn) -> None:
+        async with self._global_lock:
+            all_data = {}
+            for gid, data in self._groups.items():
+                all_data[gid] = self._serialize_group(data)
+                data.dirty = False
+            try:
+                await save_fn("iris_reply:all_groups", all_data)
+            except Exception as e:
+                logger.warning(f"Iris Reply: KV save all failed: {e}")
+            self._dirty_groups.clear()
+
+    def _serialize_group(self, data: GroupStateData) -> dict[str, Any]:
+        return {
+            "state": data.state.value,
+            "cooldown_until": data.cooldown_until,
+            "following_since": data.following_since,
+            "msg_count": data.msg_count,
+            "last_sample_time": data.last_sample_time,
+            "backoff_multiplier": data.backoff_multiplier,
+            "auto_adjust_factor": data.auto_adjust_factor,
+            "consecutive_replies": data.consecutive_replies,
+            "skip_history": list(data.skip_history),
+            "follow_up": {
+                "user_ids": list(data.follow_up.user_ids),
+                "keywords": data.follow_up.keywords,
+                "user_ttls": data.follow_up.user_ttls,
+                "keyword_ttls": data.follow_up.keyword_ttls,
+            },
+        }
+
+    def _deserialize_group(self, d: dict[str, Any]) -> GroupStateData:
+        follow_up = FollowUpEntry(
+            user_ids=set(d.get("follow_up", {}).get("user_ids", [])),
+            keywords=d.get("follow_up", {}).get("keywords", []),
+            user_ttls=d.get("follow_up", {}).get("user_ttls", {}),
+            keyword_ttls=d.get("follow_up", {}).get("keyword_ttls", {}),
+        )
+        return GroupStateData(
+            state=GroupState(d.get("state", "idle")),
+            cooldown_until=d.get("cooldown_until", 0.0),
+            following_since=d.get("following_since", 0.0),
+            msg_count=d.get("msg_count", 0),
+            last_sample_time=d.get("last_sample_time", time.time()),
+            backoff_multiplier=d.get("backoff_multiplier", 1),
+            auto_adjust_factor=d.get("auto_adjust_factor", 1.0),
+            consecutive_replies=d.get("consecutive_replies", 0),
+            skip_history=deque(d.get("skip_history", []), maxlen=20),
+            follow_up=follow_up,
+        )
+
+    def get_status_text(self, group_id: str) -> str:
+        data = self.get_state(group_id)
+        effective_n = self.get_effective_n(group_id)
+        lines = [
+            f"群 {group_id} 状态:",
+            f"  状态机: {data.state.value}",
+            f"  消息计数: {data.msg_count}/{effective_n}",
+            f"  退避倍率: {data.backoff_multiplier}",
+            f"  自动调整倍率: {data.auto_adjust_factor:.1f}",
+        ]
+        if data.state == GroupState.COOLDOWN:
+            remaining = max(0, data.cooldown_until - time.time())
+            lines.append(f"  冷却剩余: {remaining / 60:.1f} 分钟")
+        if data.follow_up.user_ids:
+            lines.append(f"  跟进用户: {', '.join(data.follow_up.user_ids)}")
+        if data.follow_up.keywords:
+            lines.append(f"  跟进关键字: {', '.join(data.follow_up.keywords)}")
+        return "\n".join(lines)

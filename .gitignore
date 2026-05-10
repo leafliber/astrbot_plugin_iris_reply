@@ -1,42 +1,30 @@
-# Python
 __pycache__/
 *.py[cod]
 *$py.class
-*.so
-.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
 
-# Virtual environments
 .venv/
 venv/
-ENV/
+env/
 
-# uv
-.python-version
-pyproject.toml
-uv.lock
-
-# IDE
 .idea/
 .vscode/
 *.swp
 *.swo
 
-# Runtime data
+*.log
+
 data/
+.opendb
 
-# Test files
-*_test.py
-test_*.py
-tests/
-.pytest_cache/
-.coverage
-htmlcov/
+.osc/
+.claude/
+.trae/
 
-# Distribution
-dist/
-build/
-*.egg-info/
-
-
-# md
-*.md
+.python-version
+pyproject.toml
+uv.lock

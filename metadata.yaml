@@ -1,7 +1,6 @@
 name: astrbot_plugin_iris_reply
-display_name: Iris Reply 主动回复
-desc: Iris Reply - 独立主动回复插件，提供信号驱动的主动接入群聊、跟进回复和关键词响应功能，可与 iris_chat_memory 协作增强
+display_name: Iris Reply
+desc: 信号驱动的群聊主动回复插件，通过本地语义盲计数 + LLM 语义决策实现低成本主动介入
+author: cassia
 version: 0.1.0
-author: Leafiber
-repo: https://github.com/leafliber/astrbot_plugin_iris_reply
-min_astrbot_version: 4.9.2
+repo: https://github.com/cassia/astrbot_plugin_iris_reply
