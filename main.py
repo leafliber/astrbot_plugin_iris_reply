@@ -3,8 +3,12 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import sys
 import time
+from pathlib import Path
 from typing import Any
+
+sys.path.insert(0, str(Path(__file__).parent))
 
 from astrbot.api import logger
 from astrbot.api.event.filter import (
