@@ -40,6 +40,7 @@ class TriggerEngine:
 
         if self.check_follow_up(group_id, sender_id, message_str):
             logger.debug(f"Iris Reply: follow-up trigger for group {group_id}")
+            self._state.reset_sampling(group_id)
             return "follow_up"
 
         self._state.increment_msg_count(group_id)
