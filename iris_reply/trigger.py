@@ -16,13 +16,13 @@ class TriggerEngine:
         self._config = config
         self._state = state
 
-    def check_follow_up(self, group_id: str, sender_id: str, message: str) -> bool:
+    def check_follow_up(self, group_id: str, sender_id: str) -> bool:
         data = self._state.get_state(group_id)
         if data.state == GroupState.COOLDOWN:
             return False
         if self._state.is_muted():
             return False
-        return self._state.match_follow_up(group_id, sender_id, message)
+        return self._state.match_follow_up(group_id, sender_id)
 
     def check_sampling(self, group_id: str) -> bool:
         return self._state.should_trigger_sampling(group_id)
@@ -36,9 +36,8 @@ class TriggerEngine:
             return None
 
         sender_id = event.get_sender_id()
-        message_str = event.message_str or ""
 
-        if self.check_follow_up(group_id, sender_id, message_str):
+        if self.check_follow_up(group_id, sender_id):
             logger.debug(f"Iris Reply: follow-up trigger for group {group_id}")
             self._state.reset_sampling(group_id)
             return "follow_up"

@@ -42,8 +42,8 @@
   "system_prompt_template": {
     "description": "Iris 专属人设模板",
     "type": "text",
-    "default": "你正在观察一个群聊。不介入是常态，介入才是例外。若不需回复请调用 skip_reply，若需回复则按需选用以下工具。",
-    "hint": "当 Iris 触发 LLM 时，此模板会注入到 extra_user_content_parts 中"
+    "default": "你正在观察一个群聊。不介入是常态，介入才是例外。请根据上下文判断是否需要回复。",
+    "hint": "当 Iris 触发 LLM 时，此模板会作为用户消息的一部分发送"
   },
   "default_n": {
     "description": "默认消息计数阈值 N",

@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-import sys
+import json
+import re
 import time
-from pathlib import Path
 from typing import Any
-
-sys.path.insert(0, str(Path(__file__).parent))
 
 from astrbot.api import logger
 from astrbot.api.event.filter import (
@@ -14,7 +12,6 @@ from astrbot.api.event.filter import (
     command,
     event_message_type,
     llm_tool,
-    on_decorating_result,
     on_llm_request,
     on_llm_response,
     permission_type,
@@ -30,6 +27,22 @@ from iris_reply.perception import ContextPackager, Gatekeeper, SlidingWindow, Wi
 from iris_reply.state import StateManager
 from iris_reply.tools import ToolContext
 from iris_reply.trigger import TriggerEngine
+
+_DETECTION_SYSTEM_PROMPT = (
+    "你正在观察一个群聊。不介入是常态，介入才是例外。\n"
+    "你需要分析聊天上下文，判断 Iris 是否需要主动回复。\n"
+    "以严格的 JSON 格式输出，不要输出其他任何内容。\n\n"
+    "输出格式：\n"
+    "```json\n"
+    "{\n"
+    '  "should_reply": true或false\n'
+    "}\n"
+    "```\n\n"
+    "规则：\n"
+    "- 只输出 JSON，不要输出其他内容\n"
+    "- 不需要回复时 should_reply 设为 false\n"
+    "- 需要回复时 should_reply 设为 true"
+)
 
 
 class IrisReply(Star):
@@ -47,6 +60,7 @@ class IrisReply(Star):
         self._admin = AdminCommands(self._state)
         self._iris_context: dict[str, str] = {}
         self._iris_active: set[str] = set()
+        self._detecting: set[str] = set()
         self._save_task: asyncio.Task | None = None
         self._save_interval = 30
 
@@ -79,57 +93,44 @@ class IrisReply(Star):
     async def _kv_load(self, key: str) -> Any:
         return await self.get_kv_data(key, None)
 
-    @llm_tool(name="skip_reply")
-    async def tool_skip_reply(self, event) -> str:
-        """当你认为不需要回复时调用此工具。调用后 Iris 将不发送任何消息，并自动增加退避倍率以减少后续触发频率。调用此工具后不要再输出任何文字。"""
-        group_id = self._tool_ctx.current_group_id or event.get_group_id()
-        if not group_id:
-            return ""
-        logger.debug(f"Iris Reply: skip_reply tool called for group {group_id}")
-        return ""
-
     @llm_tool(name="add_follow_up")
-    async def tool_add_follow_up(self, event, user_ids: str = "", keywords: str = "") -> str:
-        """当你希望持续关注某个话题或某些用户的发言时调用此工具。Iris 将在后续消息中匹配指定用户或关键字时自动触发回复。至少提供一个参数。
+    async def tool_add_follow_up(self, event, user_ids: str = "") -> str:
+        """当你希望持续关注某些用户的发言时调用此工具。Iris 将在后续消息中匹配指定用户时自动触发回复。
 
         Args:
             user_ids(string): 逗号分隔的用户ID列表，如 "user1,user2"
-            keywords(string): 逗号分隔的关键字列表，如 "关键词1,关键词2"
         """
         group_id = self._tool_ctx.current_group_id or event.get_group_id()
         if not group_id:
             return "error: no group context"
 
         uid_list = [u.strip() for u in user_ids.split(",") if u.strip()] if user_ids else None
-        kw_list = [k.strip() for k in keywords.split(",") if k.strip()] if keywords else None
 
-        if not uid_list and not kw_list:
-            return "error: must provide at least one user_id or keyword"
+        if not uid_list:
+            return "error: must provide at least one user_id"
 
         async with self._state.get_lock(group_id):
-            self._state.add_follow_up(group_id, user_ids=uid_list, keywords=kw_list)
-        logger.debug(f"Iris Reply: add_follow_up for group {group_id}, users={uid_list}, keywords={kw_list}")
-        return f"ok: following users={uid_list}, keywords={kw_list}"
+            self._state.add_follow_up(group_id, user_ids=uid_list)
+        logger.debug(f"Iris Reply: add_follow_up for group {group_id}, users={uid_list}")
+        return f"ok: following users={uid_list}"
 
     @llm_tool(name="end_follow_up")
-    async def tool_end_follow_up(self, event, user_ids: str = "", keywords: str = "") -> str:
-        """当你不再需要关注某个话题或用户时调用此工具，移除对应的跟进记录。不提供参数则移除所有跟进记录。
+    async def tool_end_follow_up(self, event, user_ids: str = "") -> str:
+        """当你不再需要关注某些用户时调用此工具，移除对应的跟进记录。不提供参数则移除所有跟进记录。
 
         Args:
             user_ids(string): 逗号分隔的用户ID列表，如 "user1,user2"
-            keywords(string): 逗号分隔的关键字列表，如 "关键词1,关键词2"
         """
         group_id = self._tool_ctx.current_group_id or event.get_group_id()
         if not group_id:
             return "error: no group context"
 
         uid_list = [u.strip() for u in user_ids.split(",") if u.strip()] if user_ids else None
-        kw_list = [k.strip() for k in keywords.split(",") if k.strip()] if keywords else None
 
         async with self._state.get_lock(group_id):
-            self._state.remove_follow_up(group_id, user_ids=uid_list, keywords=kw_list)
-        logger.debug(f"Iris Reply: end_follow_up for group {group_id}, users={uid_list}, keywords={kw_list}")
-        return f"ok: removed follow-up users={uid_list}, keywords={kw_list}"
+            self._state.remove_follow_up(group_id, user_ids=uid_list)
+        logger.debug(f"Iris Reply: end_follow_up for group {group_id}, users={uid_list}")
+        return f"ok: removed follow-up users={uid_list}"
 
     @llm_tool(name="set_cooldown")
     async def tool_set_cooldown(self, event, minutes: int = 5) -> str:
@@ -217,17 +218,66 @@ class IrisReply(Star):
         async with self._state.get_lock(group_id):
             trigger_reason = self._trigger_engine.evaluate(event)
 
-        if trigger_reason:
-            messages = self._sliding_window.get_messages(group_id)
-            context_text = self._context_packager.package(group_id, messages, trigger_reason)
-            self._iris_context[group_id] = context_text
-            self._iris_active.add(group_id)
-            event.is_at_or_wake_command = True
-            provider_id = self._config.provider_id
-            if provider_id:
-                event.set_extra("selected_provider", provider_id)
-            self._tool_ctx.set_context(group_id)
-            logger.info(f"Iris Reply: triggered ({trigger_reason}) for group {group_id}")
+        if not trigger_reason:
+            return
+
+        if group_id in self._detecting:
+            logger.debug(f"Iris Reply: detection already in progress for group {group_id}")
+            return
+
+        self._detecting.add(group_id)
+        try:
+            await self._detect_and_trigger(event, group_id, trigger_reason)
+        except Exception as e:
+            logger.error(f"Iris Reply: detection error for group {group_id}: {e}", exc_info=True)
+        finally:
+            self._detecting.discard(group_id)
+
+    async def _detect_and_trigger(
+        self, event, group_id: str, trigger_reason: str
+    ) -> None:
+        messages = self._sliding_window.get_messages(group_id)
+        context_text = self._context_packager.package(group_id, messages, trigger_reason)
+
+        provider_id = self._config.provider_id
+        if not provider_id:
+            try:
+                provider_id = await self.context.get_current_chat_provider_id(
+                    event.unified_msg_origin
+                )
+            except Exception:
+                logger.error(f"Iris Reply: failed to get provider ID for group {group_id}")
+                return
+
+        user_prompt = self._config.system_prompt_template + "\n\n" + context_text
+
+        try:
+            response = await self.context.llm_generate(
+                chat_provider_id=provider_id,
+                prompt=user_prompt,
+                system_prompt=_DETECTION_SYSTEM_PROMPT,
+            )
+        except Exception as e:
+            logger.error(f"Iris Reply: detection LLM call failed for group {group_id}: {e}")
+            return
+
+        completion = response.completion_text or ""
+        should_reply = self._parse_should_reply(completion)
+
+        if not should_reply:
+            async with self._state.get_lock(group_id):
+                self._state.record_skip_reply(group_id)
+            await self._state.save_dirty(self._kv_save)
+            logger.debug(f"Iris Reply: detection skip for group {group_id}")
+            return
+
+        self._iris_context[group_id] = context_text
+        self._iris_active.add(group_id)
+        event.is_at_or_wake_command = True
+        if provider_id:
+            event.set_extra("selected_provider", provider_id)
+        self._tool_ctx.set_context(group_id)
+        logger.info(f"Iris Reply: detection passed ({trigger_reason}), triggering standard pipeline for group {group_id}")
 
     @on_llm_request()
     async def handle_llm_request(self, event, request: ProviderRequest) -> None:
@@ -251,26 +301,41 @@ class IrisReply(Star):
 
         self._iris_active.discard(group_id)
 
-        skip_detected = "skip_reply" in response.tools_call_name
-
-        if skip_detected:
-            response.completion_text = ""
-            event.set_extra("iris_skip_reply", True)
-            event.stop_event()
-            async with self._state.get_lock(group_id):
-                self._state.record_skip_reply(group_id)
-            logger.debug(f"Iris Reply: skip_reply detected for group {group_id}")
-        else:
-            async with self._state.get_lock(group_id):
-                self._state.record_actual_reply(group_id)
-            logger.debug(f"Iris Reply: actual reply for group {group_id}")
+        async with self._state.get_lock(group_id):
+            self._state.record_actual_reply(group_id)
 
         self._tool_ctx.clear_context()
         await self._state.save_dirty(self._kv_save)
+        logger.debug(f"Iris Reply: actual reply for group {group_id}")
 
-    @on_decorating_result()
-    async def handle_decorating_result(self, event) -> None:
-        if event.get_extra("iris_skip_reply"):
-            result = event.get_result()
-            if result:
-                result.chain = []
+    @staticmethod
+    def _parse_should_reply(text: str) -> bool:
+        match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
+        if match:
+            text = match.group(1).strip()
+
+        try:
+            obj = json.loads(text)
+            if isinstance(obj, dict):
+                return bool(obj.get("should_reply", False))
+        except json.JSONDecodeError:
+            pass
+
+        brace_count = 0
+        start = -1
+        for i, c in enumerate(text):
+            if c == "{":
+                if brace_count == 0:
+                    start = i
+                brace_count += 1
+            elif c == "}":
+                brace_count -= 1
+                if brace_count == 0 and start >= 0:
+                    try:
+                        obj = json.loads(text[start : i + 1])
+                        if isinstance(obj, dict):
+                            return bool(obj.get("should_reply", False))
+                    except json.JSONDecodeError:
+                        start = -1
+
+        return False

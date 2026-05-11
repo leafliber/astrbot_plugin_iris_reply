@@ -6,7 +6,7 @@ from astrbot.api import AstrBotConfig
 _DEFAULTS = {
     "enabled": True,
     "mute_period": {
-        "start_hour": 23,
+        "start_hour": 1,
         "start_minute": 0,
         "end_hour": 7,
         "end_minute": 0,
@@ -14,12 +14,12 @@ _DEFAULTS = {
     "window_size": 10,
     "system_prompt_template": (
         "你正在观察一个群聊。不介入是常态，介入才是例外。"
-        "若不需回复请调用 skip_reply，若需回复则按需选用以下工具。"
+        "请根据上下文判断是否需要回复。"
     ),
-    "default_n": 15,
-    "default_t": 30,
+    "default_n": 30,
+    "default_t": 65,
     "max_token": 3000,
-    "follow_up_ttl": 30,
+    "follow_up_ttl": 5,
     "quality_threshold": 0.3,
     "provider_id": "",
     "whitelist": [],

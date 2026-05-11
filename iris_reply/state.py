@@ -16,15 +16,12 @@ class GroupState(Enum):
     IDLE = "idle"
     COOLDOWN = "cooldown"
     FOLLOWING = "following"
-    MUTED = "muted"
 
 
 @dataclass
 class FollowUpEntry:
     user_ids: set[str] = field(default_factory=set)
-    keywords: list[str] = field(default_factory=list)
     user_ttls: dict[str, float] = field(default_factory=dict)
-    keyword_ttls: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -73,7 +70,7 @@ class StateManager:
             self._dirty_groups.add(group_id)
         if data.state == GroupState.FOLLOWING:
             self._cleanup_expired_follow(group_id, data, now)
-            if not data.follow_up.user_ids and not data.follow_up.keywords:
+            if not data.follow_up.user_ids:
                 data.state = GroupState.IDLE
                 data.dirty = True
                 self._dirty_groups.add(group_id)
@@ -100,7 +97,6 @@ class StateManager:
         self,
         group_id: str,
         user_ids: list[str] | None = None,
-        keywords: list[str] | None = None,
     ) -> None:
         data = self._ensure_group(group_id)
         now = time.time()
@@ -109,11 +105,6 @@ class StateManager:
             for uid in user_ids:
                 data.follow_up.user_ids.add(uid)
                 data.follow_up.user_ttls[uid] = now + ttl
-        if keywords:
-            for kw in keywords:
-                if kw not in data.follow_up.keywords:
-                    data.follow_up.keywords.append(kw)
-                data.follow_up.keyword_ttls[kw] = now + ttl
         data.state = GroupState.FOLLOWING
         data.following_since = now
         data.backoff_multiplier = 1
@@ -126,19 +117,13 @@ class StateManager:
         self,
         group_id: str,
         user_ids: list[str] | None = None,
-        keywords: list[str] | None = None,
     ) -> None:
         data = self._ensure_group(group_id)
         if user_ids:
             for uid in user_ids:
                 data.follow_up.user_ids.discard(uid)
                 data.follow_up.user_ttls.pop(uid, None)
-        if keywords:
-            for kw in keywords:
-                if kw in data.follow_up.keywords:
-                    data.follow_up.keywords.remove(kw)
-                data.follow_up.keyword_ttls.pop(kw, None)
-        if not data.follow_up.user_ids and not data.follow_up.keywords:
+        if not data.follow_up.user_ids:
             data.state = GroupState.IDLE
         data.dirty = True
         self._dirty_groups.add(group_id)
@@ -148,25 +133,15 @@ class StateManager:
         for uid in expired_users:
             data.follow_up.user_ids.discard(uid)
             data.follow_up.user_ttls.pop(uid, None)
-        expired_kw = [kw for kw, ttl in data.follow_up.keyword_ttls.items() if now >= ttl]
-        for kw in expired_kw:
-            if kw in data.follow_up.keywords:
-                data.follow_up.keywords.remove(kw)
-            data.follow_up.keyword_ttls.pop(kw, None)
-        if expired_users or expired_kw:
+        if expired_users:
             data.dirty = True
             self._dirty_groups.add(group_id)
 
-    def match_follow_up(self, group_id: str, sender_id: str, message: str) -> bool:
+    def match_follow_up(self, group_id: str, sender_id: str) -> bool:
         data = self.get_state(group_id)
         if data.state == GroupState.COOLDOWN:
             return False
-        if sender_id in data.follow_up.user_ids:
-            return True
-        for kw in data.follow_up.keywords:
-            if kw in message:
-                return True
-        return False
+        return sender_id in data.follow_up.user_ids
 
     def increment_msg_count(self, group_id: str) -> int:
         data = self._ensure_group(group_id)
@@ -184,7 +159,7 @@ class StateManager:
 
     def should_trigger_sampling(self, group_id: str) -> bool:
         data = self.get_state(group_id)
-        if data.state in (GroupState.COOLDOWN, GroupState.MUTED):
+        if data.state == GroupState.COOLDOWN:
             return False
         if self.is_muted():
             return False
@@ -243,11 +218,6 @@ class StateManager:
         data.dirty = True
         self._dirty_groups.add(group_id)
 
-    def mark_dirty(self, group_id: str) -> None:
-        data = self._ensure_group(group_id)
-        data.dirty = True
-        self._dirty_groups.add(group_id)
-
     async def save_dirty(self, save_fn) -> None:
         async with self._global_lock:
             for gid in list(self._dirty_groups):
@@ -295,18 +265,14 @@ class StateManager:
             "skip_history": list(data.skip_history),
             "follow_up": {
                 "user_ids": list(data.follow_up.user_ids),
-                "keywords": data.follow_up.keywords,
                 "user_ttls": data.follow_up.user_ttls,
-                "keyword_ttls": data.follow_up.keyword_ttls,
             },
         }
 
     def _deserialize_group(self, d: dict[str, Any]) -> GroupStateData:
         follow_up = FollowUpEntry(
             user_ids=set(d.get("follow_up", {}).get("user_ids", [])),
-            keywords=d.get("follow_up", {}).get("keywords", []),
             user_ttls=d.get("follow_up", {}).get("user_ttls", {}),
-            keyword_ttls=d.get("follow_up", {}).get("keyword_ttls", {}),
         )
         return GroupStateData(
             state=GroupState(d.get("state", "idle")),
@@ -336,6 +302,4 @@ class StateManager:
             lines.append(f"  冷却剩余: {remaining / 60:.1f} 分钟")
         if data.follow_up.user_ids:
             lines.append(f"  跟进用户: {', '.join(data.follow_up.user_ids)}")
-        if data.follow_up.keywords:
-            lines.append(f"  跟进关键字: {', '.join(data.follow_up.keywords)}")
         return "\n".join(lines)
