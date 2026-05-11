@@ -14,6 +14,7 @@ from astrbot.api.event.filter import (
     command,
     event_message_type,
     llm_tool,
+    on_decorating_result,
     on_llm_request,
     on_llm_response,
     permission_type,
@@ -80,14 +81,12 @@ class IrisReply(Star):
 
     @llm_tool(name="skip_reply")
     async def tool_skip_reply(self, event) -> str:
-        """当你认为不需要回复时调用此工具。调用后 Iris 将不发送任何消息，并自动增加退避倍率以减少后续触发频率。"""
+        """当你认为不需要回复时调用此工具。调用后 Iris 将不发送任何消息，并自动增加退避倍率以减少后续触发频率。调用此工具后不要再输出任何文字。"""
         group_id = self._tool_ctx.current_group_id or event.get_group_id()
         if not group_id:
-            return "error: no group context"
-        async with self._state.get_lock(group_id):
-            self._state.record_skip_reply(group_id)
-        logger.debug(f"Iris Reply: skip_reply for group {group_id}")
-        return "ok: skipped reply, backoff increased"
+            return ""
+        logger.debug(f"Iris Reply: skip_reply tool called for group {group_id}")
+        return ""
 
     @llm_tool(name="add_follow_up")
     async def tool_add_follow_up(self, event, user_ids: str = "", keywords: str = "") -> str:
@@ -255,6 +254,8 @@ class IrisReply(Star):
         skip_detected = "skip_reply" in response.tools_call_name
 
         if skip_detected:
+            response.completion_text = ""
+            event.set_extra("iris_skip_reply", True)
             event.stop_event()
             async with self._state.get_lock(group_id):
                 self._state.record_skip_reply(group_id)
@@ -266,3 +267,10 @@ class IrisReply(Star):
 
         self._tool_ctx.clear_context()
         await self._state.save_dirty(self._kv_save)
+
+    @on_decorating_result()
+    async def handle_decorating_result(self, event) -> None:
+        if event.get_extra("iris_skip_reply"):
+            result = event.get_result()
+            if result:
+                result.chain = []
