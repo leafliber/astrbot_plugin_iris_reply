@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from astrbot.api import logger
 from astrbot.api.event.filter import (
     EventMessageType,
-    command,
+    command_group,
     event_message_type,
     llm_tool,
     on_llm_request,
@@ -154,7 +154,35 @@ class IrisReply(Star):
         logger.debug(f"Iris Reply: set_cooldown for group {group_id}, {minutes} min")
         return f"ok: cooldown set for {minutes} minutes"
 
-    @command("iris_reply_status")
+    @command_group("iris_reply")
+    def iris(self):
+        pass
+
+    @iris.command("enable")
+    @permission_type(PermissionType.ADMIN)
+    @event_message_type(EventMessageType.GROUP_MESSAGE)
+    async def cmd_enable(self, event) -> None:
+        group_id = event.get_group_id()
+        if not group_id:
+            event.set_result("无法获取群ID")
+            return
+        self._state.add_to_whitelist(group_id)
+        await self._state.save_all(self._kv_save)
+        event.set_result(f"群 {group_id} 已启用 Iris Reply")
+
+    @iris.command("disable")
+    @permission_type(PermissionType.ADMIN)
+    @event_message_type(EventMessageType.GROUP_MESSAGE)
+    async def cmd_disable(self, event) -> None:
+        group_id = event.get_group_id()
+        if not group_id:
+            event.set_result("无法获取群ID")
+            return
+        self._state.remove_from_whitelist(group_id)
+        await self._state.save_all(self._kv_save)
+        event.set_result(f"群 {group_id} 已禁用 Iris Reply")
+
+    @iris.command("status")
     @permission_type(PermissionType.ADMIN)
     @event_message_type(EventMessageType.GROUP_MESSAGE)
     async def cmd_status(self, event) -> None:
@@ -165,7 +193,7 @@ class IrisReply(Star):
         text = self._admin.get_status(group_id)
         event.set_result(text)
 
-    @command("iris_reply_reset")
+    @iris.command("reset")
     @permission_type(PermissionType.ADMIN)
     @event_message_type(EventMessageType.GROUP_MESSAGE)
     async def cmd_reset(self, event) -> None:
@@ -177,7 +205,7 @@ class IrisReply(Star):
         await self._state.save_dirty(self._kv_save)
         event.set_result(msg)
 
-    @command("iris_reply_cooldown")
+    @iris.command("cooldown")
     @permission_type(PermissionType.ADMIN)
     @event_message_type(EventMessageType.GROUP_MESSAGE)
     async def cmd_cooldown(self, event, minutes: int = 5) -> None:

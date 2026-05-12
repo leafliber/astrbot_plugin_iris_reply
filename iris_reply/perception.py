@@ -41,8 +41,7 @@ class Gatekeeper:
         if self._state.is_muted():
             return False
         group_id = event.get_group_id()
-        whitelist = self._config.whitelist
-        if whitelist and group_id not in whitelist:
+        if not self._state.is_whitelisted(group_id):
             return False
         return True
 

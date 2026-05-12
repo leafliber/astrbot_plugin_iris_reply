@@ -80,11 +80,5 @@
     "type": "string",
     "default": "",
     "_special": "select_provider"
-  },
-  "whitelist": {
-    "description": "白名单群组 ID 列表",
-    "type": "list",
-    "default": [],
-    "hint": "为空则不启用任何群的触发。使用 /iris_reply status 获取群 ID"
   }
 }

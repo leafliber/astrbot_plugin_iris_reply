@@ -22,7 +22,6 @@ _DEFAULTS = {
     "follow_up_ttl": 5,
     "quality_threshold": 0.3,
     "provider_id": "",
-    "whitelist": [],
 }
 
 
@@ -91,10 +90,3 @@ class ConfigManager:
     @property
     def provider_id(self) -> str:
         return str(self._get("provider_id", ""))
-
-    @property
-    def whitelist(self) -> list[str]:
-        wl = self._get("whitelist", [])
-        if not isinstance(wl, list):
-            return []
-        return [str(g) for g in wl]

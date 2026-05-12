@@ -48,6 +48,7 @@ class StateManager:
         self._locks: dict[str, asyncio.Lock] = {}
         self._dirty_groups: set[str] = set()
         self._global_lock = asyncio.Lock()
+        self._whitelist: set[str] = set()
 
     def get_lock(self, group_id: str) -> asyncio.Lock:
         if group_id not in self._locks:
@@ -230,7 +231,25 @@ class StateManager:
                         logger.warning(f"Iris Reply: KV save failed for group {gid}: {e}")
             self._dirty_groups.clear()
 
+    def is_whitelisted(self, group_id: str) -> bool:
+        return group_id in self._whitelist
+
+    def add_to_whitelist(self, group_id: str) -> None:
+        self._whitelist.add(group_id)
+
+    def remove_from_whitelist(self, group_id: str) -> None:
+        self._whitelist.discard(group_id)
+
+    def get_whitelist(self) -> set[str]:
+        return set(self._whitelist)
+
     async def load_all(self, load_fn) -> None:
+        try:
+            wl_data = await load_fn("iris_reply:whitelist")
+            if wl_data and isinstance(wl_data, list):
+                self._whitelist = set(str(g) for g in wl_data)
+        except Exception as e:
+            logger.warning(f"Iris Reply: whitelist KV load failed: {e}")
         try:
             all_data = await load_fn("iris_reply:all_groups")
             if not all_data or not isinstance(all_data, dict):
@@ -242,6 +261,10 @@ class StateManager:
 
     async def save_all(self, save_fn) -> None:
         async with self._global_lock:
+            try:
+                await save_fn("iris_reply:whitelist", list(self._whitelist))
+            except Exception as e:
+                logger.warning(f"Iris Reply: whitelist KV save failed: {e}")
             all_data = {}
             for gid, data in self._groups.items():
                 all_data[gid] = self._serialize_group(data)
