@@ -12,10 +12,6 @@ _DEFAULTS = {
         "end_minute": 0,
     },
     "window_size": 10,
-    "system_prompt_template": (
-        "你正在观察一个群聊。不介入是常态，介入才是例外。"
-        "请根据上下文判断是否需要回复。"
-    ),
     "default_n": 30,
     "default_t": 65,
     "max_token": 3000,
@@ -62,10 +58,6 @@ class ConfigManager:
     @property
     def window_size(self) -> int:
         return max(5, min(30, int(self._get("window_size", 10))))
-
-    @property
-    def system_prompt_template(self) -> str:
-        return str(self._get("system_prompt_template", _DEFAULTS["system_prompt_template"]))
 
     @property
     def default_n(self) -> int:

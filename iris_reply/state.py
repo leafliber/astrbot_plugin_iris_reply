@@ -10,6 +10,7 @@ from typing import Any
 from astrbot.api import logger
 
 from .config import ConfigManager
+from .prompts import DEFAULT_LEVEL, VALID_LEVELS
 
 
 class GroupState(Enum):
@@ -36,6 +37,7 @@ class GroupStateData:
     consecutive_replies: int = 0
     skip_history: deque = field(default_factory=lambda: deque(maxlen=20))
     follow_up: FollowUpEntry = field(default_factory=FollowUpEntry)
+    willingness: str = DEFAULT_LEVEL
     dirty: bool = False
 
 
@@ -231,6 +233,20 @@ class StateManager:
                         logger.warning(f"Iris Reply: KV save failed for group {gid}: {e}")
             self._dirty_groups.clear()
 
+    def get_willingness(self, group_id: str) -> str:
+        data = self._ensure_group(group_id)
+        if data.willingness not in VALID_LEVELS:
+            data.willingness = DEFAULT_LEVEL
+        return data.willingness
+
+    def set_willingness(self, group_id: str, level: str) -> None:
+        if level not in VALID_LEVELS:
+            return
+        data = self._ensure_group(group_id)
+        data.willingness = level
+        data.dirty = True
+        self._dirty_groups.add(group_id)
+
     def is_whitelisted(self, group_id: str) -> bool:
         return group_id in self._whitelist
 
@@ -290,6 +306,7 @@ class StateManager:
                 "user_ids": list(data.follow_up.user_ids),
                 "user_ttls": data.follow_up.user_ttls,
             },
+            "willingness": data.willingness,
         }
 
     def _deserialize_group(self, d: dict[str, Any]) -> GroupStateData:
@@ -297,6 +314,9 @@ class StateManager:
             user_ids=set(d.get("follow_up", {}).get("user_ids", [])),
             user_ttls=d.get("follow_up", {}).get("user_ttls", {}),
         )
+        willingness = d.get("willingness", DEFAULT_LEVEL)
+        if willingness not in VALID_LEVELS:
+            willingness = DEFAULT_LEVEL
         return GroupStateData(
             state=GroupState(d.get("state", "idle")),
             cooldown_until=d.get("cooldown_until", 0.0),
@@ -308,14 +328,18 @@ class StateManager:
             consecutive_replies=d.get("consecutive_replies", 0),
             skip_history=deque(d.get("skip_history", []), maxlen=20),
             follow_up=follow_up,
+            willingness=willingness,
         )
 
     def get_status_text(self, group_id: str) -> str:
+        from .prompts import display_level
+
         data = self.get_state(group_id)
         effective_n = self.get_effective_n(group_id)
         lines = [
             f"群 {group_id} 状态:",
             f"  状态机: {data.state.value}",
+            f"  回复意愿: {display_level(data.willingness)}",
             f"  消息计数: {data.msg_count}/{effective_n}",
             f"  退避倍率: {data.backoff_multiplier}",
             f"  自动调整倍率: {data.auto_adjust_factor:.1f}",

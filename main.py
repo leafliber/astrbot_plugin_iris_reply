@@ -28,25 +28,10 @@ from astrbot.core.provider.entities import LLMResponse, ProviderRequest
 from iris_reply.admin import AdminCommands
 from iris_reply.config import ConfigManager
 from iris_reply.perception import ContextPackager, Gatekeeper, SlidingWindow, WindowMessage
+from iris_reply.prompts import WILLINGNESS_PROMPTS
 from iris_reply.state import StateManager
 from iris_reply.tools import ToolContext
 from iris_reply.trigger import TriggerEngine
-
-_DETECTION_SYSTEM_PROMPT = (
-    "你正在观察一个群聊。不介入是常态，介入才是例外。\n"
-    "你需要分析聊天上下文，判断 Iris 是否需要主动回复。\n"
-    "以严格的 JSON 格式输出，不要输出其他任何内容。\n\n"
-    "输出格式：\n"
-    "```json\n"
-    "{\n"
-    '  "should_reply": true或false\n'
-    "}\n"
-    "```\n\n"
-    "规则：\n"
-    "- 只输出 JSON，不要输出其他内容\n"
-    "- 不需要回复时 should_reply 设为 false\n"
-    "- 需要回复时 should_reply 设为 true"
-)
 
 
 class IrisReply(Star):
@@ -217,6 +202,22 @@ class IrisReply(Star):
         await self._state.save_dirty(self._kv_save)
         event.set_result(msg)
 
+    @iris.command("willingness")
+    @permission_type(PermissionType.ADMIN)
+    @event_message_type(EventMessageType.GROUP_MESSAGE)
+    async def cmd_willingness(self, event, level: str = "") -> None:
+        group_id = event.get_group_id()
+        if not group_id:
+            event.set_result("无法获取群ID")
+            return
+        if not level.strip():
+            current = self._admin.get_willingness(group_id)
+            event.set_result(f"群 {group_id} 当前回复意愿: {current}\n可选: 低/中/高 (low/medium/high)")
+            return
+        msg = self._admin.set_willingness(group_id, level.strip())
+        await self._state.save_dirty(self._kv_save)
+        event.set_result(msg)
+
     @event_message_type(EventMessageType.GROUP_MESSAGE)
     async def on_message(self, event) -> None:
         if not self._config.enabled:
@@ -281,13 +282,15 @@ class IrisReply(Star):
                 logger.error(f"Iris Reply: failed to get provider ID for group {group_id}")
                 return
 
-        user_prompt = self._config.system_prompt_template + "\n\n" + context_text
+        willingness = self._state.get_willingness(group_id)
+        prompts = WILLINGNESS_PROMPTS[willingness]
+        user_prompt = prompts["persona"] + "\n\n" + context_text
 
         try:
             response = await self.context.llm_generate(
                 chat_provider_id=provider_id,
                 prompt=user_prompt,
-                system_prompt=_DETECTION_SYSTEM_PROMPT,
+                system_prompt=prompts["detection_system"],
             )
         except Exception as e:
             logger.error(f"Iris Reply: detection LLM call failed for group {group_id}: {e}")
@@ -318,8 +321,9 @@ class IrisReply(Star):
             return
 
         context_text = self._iris_context.pop(group_id)
-        prompt = self._config.system_prompt_template
-        combined = f"{prompt}\n\n{context_text}"
+        willingness = self._state.get_willingness(group_id)
+        persona = WILLINGNESS_PROMPTS[willingness]["persona"]
+        combined = f"{persona}\n\n{context_text}"
 
         request.extra_user_content_parts.append(TextPart(text=combined))
 
