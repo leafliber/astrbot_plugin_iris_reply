@@ -10,7 +10,13 @@ from typing import Any
 from astrbot.api import logger
 
 from .config import ConfigManager
-from .prompts import DEFAULT_LEVEL, VALID_LEVELS
+from .prompts import (
+    BACKOFF_BASE,
+    DEFAULT_LEVEL,
+    MAX_BACKOFF_LEVEL,
+    VALID_LEVELS,
+    WILLINGNESS_THRESHOLD_ADJUST,
+)
 
 
 class GroupState(Enum):
@@ -32,7 +38,7 @@ class GroupStateData:
     following_since: float = 0.0
     msg_count: int = 0
     last_sample_time: float = 0.0
-    backoff_multiplier: int = 1
+    backoff_level: int = 0
     auto_adjust_factor: float = 1.0
     consecutive_replies: int = 0
     skip_history: deque = field(default_factory=lambda: deque(maxlen=20))
@@ -43,6 +49,7 @@ class GroupStateData:
 
 class StateManager:
     N_MAX = 120
+    T_MAX = 300
 
     def __init__(self, config: ConfigManager) -> None:
         self._config = config
@@ -110,7 +117,7 @@ class StateManager:
                 data.follow_up.user_ttls[uid] = now + ttl
         data.state = GroupState.FOLLOWING
         data.following_since = now
-        data.backoff_multiplier = 1
+        data.backoff_level = 0
         data.auto_adjust_factor = 1.0
         data.consecutive_replies = 0
         data.dirty = True
@@ -153,12 +160,22 @@ class StateManager:
         self._dirty_groups.add(group_id)
         return data.msg_count
 
-    def get_effective_n(self, group_id: str) -> int:
+    def get_effective_thresholds(self, group_id: str) -> tuple[int, int]:
         data = self._ensure_group(group_id)
-        base_n = self._config.default_n
-        adjusted_n = int(base_n * data.auto_adjust_factor)
-        effective_n = adjusted_n * data.backoff_multiplier
-        return min(effective_n, self.N_MAX)
+        backoff_factor = BACKOFF_BASE ** data.backoff_level
+        combined = data.auto_adjust_factor * backoff_factor
+        w_adj = WILLINGNESS_THRESHOLD_ADJUST.get(
+            data.willingness, WILLINGNESS_THRESHOLD_ADJUST[DEFAULT_LEVEL]
+        )
+        effective_n = min(
+            max(5, int(self._config.default_n * combined * w_adj["n_factor"])),
+            self.N_MAX,
+        )
+        effective_t = min(
+            max(5, int(self._config.default_t * combined * w_adj["t_factor"])),
+            self.T_MAX,
+        )
+        return effective_n, effective_t
 
     def should_trigger_sampling(self, group_id: str) -> bool:
         data = self.get_state(group_id)
@@ -166,11 +183,11 @@ class StateManager:
             return False
         if self.is_muted():
             return False
-        effective_n = self.get_effective_n(group_id)
+        effective_n, effective_t = self.get_effective_thresholds(group_id)
         if data.msg_count >= effective_n:
             return True
         elapsed = time.time() - data.last_sample_time
-        if elapsed >= self._config.default_t * 60 and data.msg_count > 0:
+        if elapsed >= effective_t * 60 and data.msg_count > 0:
             return True
         return False
 
@@ -183,7 +200,8 @@ class StateManager:
 
     def record_skip_reply(self, group_id: str) -> None:
         data = self._ensure_group(group_id)
-        data.backoff_multiplier = min(data.backoff_multiplier * 2, self.N_MAX // max(self._config.default_n, 1))
+        if data.backoff_level < MAX_BACKOFF_LEVEL:
+            data.backoff_level += 1
         data.consecutive_replies = 0
         data.skip_history.append(time.time())
         self._check_auto_adjust(group_id, data)
@@ -192,11 +210,14 @@ class StateManager:
 
     def record_actual_reply(self, group_id: str) -> None:
         data = self._ensure_group(group_id)
-        data.backoff_multiplier = 1
+        data.backoff_level = max(0, data.backoff_level - 1)
         data.consecutive_replies += 1
         if data.consecutive_replies >= 2:
             data.auto_adjust_factor = 1.0
+            data.backoff_level = 0
             data.consecutive_replies = 0
+        elif data.auto_adjust_factor > 1.0:
+            data.auto_adjust_factor = max(1.0, data.auto_adjust_factor / 1.2)
         data.dirty = True
         self._dirty_groups.add(group_id)
 
@@ -206,15 +227,19 @@ class StateManager:
         recent_skips = sum(1 for t in data.skip_history if t >= one_hour_ago)
         if recent_skips >= 3:
             new_factor = data.auto_adjust_factor * 1.5
-            test_n = int(self._config.default_n * new_factor)
-            if test_n <= self.N_MAX:
+            w_adj = WILLINGNESS_THRESHOLD_ADJUST.get(
+                data.willingness, WILLINGNESS_THRESHOLD_ADJUST[DEFAULT_LEVEL]
+            )
+            test_n = int(self._config.default_n * new_factor * w_adj["n_factor"])
+            test_t = int(self._config.default_t * new_factor * w_adj["t_factor"])
+            if test_n <= self.N_MAX and test_t <= self.T_MAX:
                 data.auto_adjust_factor = new_factor
 
     def reset_group(self, group_id: str) -> None:
         data = self._ensure_group(group_id)
         data.msg_count = 0
         data.last_sample_time = time.time()
-        data.backoff_multiplier = 1
+        data.backoff_level = 0
         data.auto_adjust_factor = 1.0
         data.consecutive_replies = 0
         data.skip_history.clear()
@@ -298,7 +323,7 @@ class StateManager:
             "following_since": data.following_since,
             "msg_count": data.msg_count,
             "last_sample_time": data.last_sample_time,
-            "backoff_multiplier": data.backoff_multiplier,
+            "backoff_level": data.backoff_level,
             "auto_adjust_factor": data.auto_adjust_factor,
             "consecutive_replies": data.consecutive_replies,
             "skip_history": list(data.skip_history),
@@ -310,6 +335,8 @@ class StateManager:
         }
 
     def _deserialize_group(self, d: dict[str, Any]) -> GroupStateData:
+        import math
+
         follow_up = FollowUpEntry(
             user_ids=set(d.get("follow_up", {}).get("user_ids", [])),
             user_ttls=d.get("follow_up", {}).get("user_ttls", {}),
@@ -317,13 +344,20 @@ class StateManager:
         willingness = d.get("willingness", DEFAULT_LEVEL)
         if willingness not in VALID_LEVELS:
             willingness = DEFAULT_LEVEL
+        if "backoff_level" in d:
+            backoff_level = min(d["backoff_level"], MAX_BACKOFF_LEVEL)
+        elif "backoff_multiplier" in d:
+            old_mult = max(d["backoff_multiplier"], 1)
+            backoff_level = min(int(math.log2(old_mult)), MAX_BACKOFF_LEVEL)
+        else:
+            backoff_level = 0
         return GroupStateData(
             state=GroupState(d.get("state", "idle")),
             cooldown_until=d.get("cooldown_until", 0.0),
             following_since=d.get("following_since", 0.0),
             msg_count=d.get("msg_count", 0),
             last_sample_time=d.get("last_sample_time", time.time()),
-            backoff_multiplier=d.get("backoff_multiplier", 1),
+            backoff_level=backoff_level,
             auto_adjust_factor=d.get("auto_adjust_factor", 1.0),
             consecutive_replies=d.get("consecutive_replies", 0),
             skip_history=deque(d.get("skip_history", []), maxlen=20),
@@ -335,14 +369,16 @@ class StateManager:
         from .prompts import display_level
 
         data = self.get_state(group_id)
-        effective_n = self.get_effective_n(group_id)
+        effective_n, effective_t = self.get_effective_thresholds(group_id)
+        backoff_factor = BACKOFF_BASE ** data.backoff_level
         lines = [
             f"群 {group_id} 状态:",
             f"  状态机: {data.state.value}",
             f"  回复意愿: {display_level(data.willingness)}",
             f"  消息计数: {data.msg_count}/{effective_n}",
-            f"  退避倍率: {data.backoff_multiplier}",
+            f"  退避等级: {data.backoff_level} (×{backoff_factor:.2f})",
             f"  自动调整倍率: {data.auto_adjust_factor:.1f}",
+            f"  有效阈值: N={effective_n}, T={effective_t}分钟",
         ]
         if data.state == GroupState.COOLDOWN:
             remaining = max(0, data.cooldown_until - time.time())

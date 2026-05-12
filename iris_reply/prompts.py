@@ -3,6 +3,9 @@ from __future__ import annotations
 VALID_LEVELS = ("low", "medium", "high")
 DEFAULT_LEVEL = "medium"
 
+BACKOFF_BASE = 1.5
+MAX_BACKOFF_LEVEL = 5
+
 _DISPLAY = {"low": "低", "medium": "中", "high": "高"}
 
 _INPUT_MAP = {
@@ -12,6 +15,12 @@ _INPUT_MAP = {
     "low": "low",
     "medium": "medium",
     "high": "high",
+}
+
+WILLINGNESS_THRESHOLD_ADJUST = {
+    "low": {"n_factor": 1.5, "t_factor": 1.5},
+    "medium": {"n_factor": 1.0, "t_factor": 1.0},
+    "high": {"n_factor": 0.6, "t_factor": 0.6},
 }
 
 _JSON_FORMAT_SECTION = (
