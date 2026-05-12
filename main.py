@@ -140,12 +140,12 @@ class IrisReply(Star):
         return f"ok: cooldown set for {minutes} minutes"
 
     @command_group("iris_reply")
+    @permission_type(PermissionType.ADMIN)
+    @event_message_type(EventMessageType.GROUP_MESSAGE)
     def iris(self):
         pass
 
     @iris.command("enable")
-    @permission_type(PermissionType.ADMIN)
-    @event_message_type(EventMessageType.GROUP_MESSAGE)
     async def cmd_enable(self, event) -> None:
         group_id = event.get_group_id()
         if not group_id:
@@ -156,8 +156,6 @@ class IrisReply(Star):
         event.set_result(f"群 {group_id} 已启用 Iris Reply")
 
     @iris.command("disable")
-    @permission_type(PermissionType.ADMIN)
-    @event_message_type(EventMessageType.GROUP_MESSAGE)
     async def cmd_disable(self, event) -> None:
         group_id = event.get_group_id()
         if not group_id:
@@ -168,8 +166,6 @@ class IrisReply(Star):
         event.set_result(f"群 {group_id} 已禁用 Iris Reply")
 
     @iris.command("status")
-    @permission_type(PermissionType.ADMIN)
-    @event_message_type(EventMessageType.GROUP_MESSAGE)
     async def cmd_status(self, event) -> None:
         group_id = event.get_group_id()
         if not group_id:
@@ -179,8 +175,6 @@ class IrisReply(Star):
         event.set_result(text)
 
     @iris.command("reset")
-    @permission_type(PermissionType.ADMIN)
-    @event_message_type(EventMessageType.GROUP_MESSAGE)
     async def cmd_reset(self, event) -> None:
         group_id = event.get_group_id()
         if not group_id:
@@ -191,8 +185,6 @@ class IrisReply(Star):
         event.set_result(msg)
 
     @iris.command("cooldown")
-    @permission_type(PermissionType.ADMIN)
-    @event_message_type(EventMessageType.GROUP_MESSAGE)
     async def cmd_cooldown(self, event, minutes: int = 5) -> None:
         group_id = event.get_group_id()
         if not group_id:
@@ -203,8 +195,6 @@ class IrisReply(Star):
         event.set_result(msg)
 
     @iris.command("willingness")
-    @permission_type(PermissionType.ADMIN)
-    @event_message_type(EventMessageType.GROUP_MESSAGE)
     async def cmd_willingness(self, event, level: str = "") -> None:
         group_id = event.get_group_id()
         if not group_id:
