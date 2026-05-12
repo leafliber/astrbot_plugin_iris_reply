@@ -18,6 +18,9 @@ _DEFAULTS = {
     "follow_up_ttl": 5,
     "quality_threshold": 0.3,
     "provider_id": "",
+    "boost_factor": 0.7,
+    "boost_duration": 10,
+    "max_boosted_replies": 3,
 }
 
 
@@ -82,3 +85,15 @@ class ConfigManager:
     @property
     def provider_id(self) -> str:
         return str(self._get("provider_id", ""))
+
+    @property
+    def boost_factor(self) -> float:
+        return max(0.3, min(0.95, float(self._get("boost_factor", 0.7))))
+
+    @property
+    def boost_duration(self) -> int:
+        return max(1, min(60, int(self._get("boost_duration", 10))))
+
+    @property
+    def max_boosted_replies(self) -> int:
+        return max(2, min(10, int(self._get("max_boosted_replies", 3))))

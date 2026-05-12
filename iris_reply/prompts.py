@@ -29,13 +29,18 @@ _JSON_FORMAT_SECTION = (
     "输出格式：\n"
     "```json\n"
     "{\n"
-    '  "should_reply": true或false\n'
+    '  "should_reply": true或false,\n'
+    '  "follow_up_users": ["用户ID列表"],\n'
+    '  "interest_reason": "关注原因"\n'
     "}\n"
     "```\n\n"
     "规则：\n"
     "- 只输出 JSON，不要输出其他内容\n"
     "- 不需要回复时 should_reply 设为 false\n"
-    "- 需要回复时 should_reply 设为 true"
+    "- 需要回复时 should_reply 设为 true\n"
+    "- 如果虽然当前不需要回复，但你对某些用户的后续发言感兴趣，将他们的用户ID填入 follow_up_users\n"
+    "- interest_reason 简要说明关注原因（不需要关注时留空字符串）\n"
+    "- 不需要特别关注任何人时，follow_up_users 设为空数组 []"
 )
 
 WILLINGNESS_PROMPTS = {

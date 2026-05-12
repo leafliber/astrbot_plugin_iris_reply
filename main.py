@@ -5,6 +5,7 @@ import json
 import re
 import sys
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,13 @@ from iris_reply.prompts import WILLINGNESS_PROMPTS
 from iris_reply.state import StateManager
 from iris_reply.tools import ToolContext
 from iris_reply.trigger import TriggerEngine
+
+
+@dataclass
+class DetectionResult:
+    should_reply: bool = False
+    follow_up_users: list[str] = field(default_factory=list)
+    interest_reason: str = ""
 
 
 class IrisReply(Star):
@@ -287,9 +295,17 @@ class IrisReply(Star):
             return
 
         completion = response.completion_text or ""
-        should_reply = self._parse_should_reply(completion)
+        result = self._parse_detection(completion)
 
-        if not should_reply:
+        if result.follow_up_users:
+            async with self._state.get_lock(group_id):
+                self._state.add_follow_up(group_id, user_ids=result.follow_up_users)
+            logger.info(
+                f"Iris Reply: detection follow-up for group {group_id}, "
+                f"users={result.follow_up_users}, reason={result.interest_reason}"
+            )
+
+        if not result.should_reply:
             async with self._state.get_lock(group_id):
                 self._state.record_skip_reply(group_id)
             await self._state.save_dirty(self._kv_save)
@@ -335,33 +351,42 @@ class IrisReply(Star):
         logger.debug(f"Iris Reply: actual reply for group {group_id}")
 
     @staticmethod
-    def _parse_should_reply(text: str) -> bool:
+    def _parse_detection(text: str) -> DetectionResult:
         match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
         if match:
             text = match.group(1).strip()
 
+        obj = None
         try:
             obj = json.loads(text)
-            if isinstance(obj, dict):
-                return bool(obj.get("should_reply", False))
         except json.JSONDecodeError:
-            pass
+            brace_count = 0
+            start = -1
+            for i, c in enumerate(text):
+                if c == "{":
+                    if brace_count == 0:
+                        start = i
+                    brace_count += 1
+                elif c == "}":
+                    brace_count -= 1
+                    if brace_count == 0 and start >= 0:
+                        try:
+                            obj = json.loads(text[start : i + 1])
+                        except json.JSONDecodeError:
+                            start = -1
 
-        brace_count = 0
-        start = -1
-        for i, c in enumerate(text):
-            if c == "{":
-                if brace_count == 0:
-                    start = i
-                brace_count += 1
-            elif c == "}":
-                brace_count -= 1
-                if brace_count == 0 and start >= 0:
-                    try:
-                        obj = json.loads(text[start : i + 1])
-                        if isinstance(obj, dict):
-                            return bool(obj.get("should_reply", False))
-                    except json.JSONDecodeError:
-                        start = -1
+        if not isinstance(obj, dict):
+            return DetectionResult()
 
-        return False
+        should_reply = bool(obj.get("should_reply", False))
+        follow_up_raw = obj.get("follow_up_users", [])
+        follow_up_users = []
+        if isinstance(follow_up_raw, list):
+            follow_up_users = [str(u).strip() for u in follow_up_raw if str(u).strip()]
+        interest_reason = str(obj.get("interest_reason", ""))
+
+        return DetectionResult(
+            should_reply=should_reply,
+            follow_up_users=follow_up_users,
+            interest_reason=interest_reason,
+        )

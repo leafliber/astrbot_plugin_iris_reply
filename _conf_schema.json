@@ -74,5 +74,23 @@
     "type": "string",
     "default": "",
     "_special": "select_provider"
+  },
+  "boost_factor": {
+    "description": "回复后频率提升系数",
+    "type": "float",
+    "default": 0.7,
+    "hint": "Iris 回复后有效阈值临时乘以此系数（<1.0 降低阈值），范围 0.3-0.95"
+  },
+  "boost_duration": {
+    "description": "频率提升持续时间（分钟）",
+    "type": "int",
+    "default": 10,
+    "hint": "回复后 boost 效果的持续时间，之后线性衰减回正常，范围 1-60"
+  },
+  "max_boosted_replies": {
+    "description": "最大连续回复 boost 次数",
+    "type": "int",
+    "default": 3,
+    "hint": "连续回复不超过此次数时享受完整 boost，超出后逐渐减弱，范围 2-10"
   }
 }

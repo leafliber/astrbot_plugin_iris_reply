@@ -44,6 +44,9 @@ class GroupStateData:
     skip_history: deque = field(default_factory=lambda: deque(maxlen=20))
     follow_up: FollowUpEntry = field(default_factory=FollowUpEntry)
     willingness: str = DEFAULT_LEVEL
+    boost_initial: float = 1.0
+    boost_set_at: float = 0.0
+    boost_until: float = 0.0
     dirty: bool = False
 
 
@@ -160,10 +163,22 @@ class StateManager:
         self._dirty_groups.add(group_id)
         return data.msg_count
 
+    def _current_boost(self, data: GroupStateData) -> float:
+        now = time.time()
+        if now >= data.boost_until or data.boost_initial >= 1.0:
+            return 1.0
+        elapsed = now - data.boost_set_at
+        total = data.boost_until - data.boost_set_at
+        if total <= 0:
+            return 1.0
+        progress = min(1.0, elapsed / total)
+        return data.boost_initial + (1.0 - data.boost_initial) * progress
+
     def get_effective_thresholds(self, group_id: str) -> tuple[int, int]:
         data = self._ensure_group(group_id)
         backoff_factor = BACKOFF_BASE ** data.backoff_level
-        combined = data.auto_adjust_factor * backoff_factor
+        boost = self._current_boost(data)
+        combined = data.auto_adjust_factor * backoff_factor * boost
         w_adj = WILLINGNESS_THRESHOLD_ADJUST.get(
             data.willingness, WILLINGNESS_THRESHOLD_ADJUST[DEFAULT_LEVEL]
         )
@@ -212,11 +227,24 @@ class StateManager:
         data = self._ensure_group(group_id)
         data.backoff_level = max(0, data.backoff_level - 1)
         data.consecutive_replies += 1
-        if data.consecutive_replies >= 2:
-            data.auto_adjust_factor = 1.0
-            data.backoff_level = 0
-            data.consecutive_replies = 0
-        elif data.auto_adjust_factor > 1.0:
+
+        max_br = self._config.max_boosted_replies
+        if data.consecutive_replies <= max_br:
+            strength = self._config.boost_factor
+        elif data.consecutive_replies <= max_br * 2:
+            over = data.consecutive_replies - max_br
+            strength = 1.0 - (1.0 - self._config.boost_factor) * max(0.0, 1.0 - over / max_br)
+        else:
+            strength = 1.0
+            if data.backoff_level < MAX_BACKOFF_LEVEL:
+                data.backoff_level = min(data.backoff_level + 1, MAX_BACKOFF_LEVEL)
+
+        now = time.time()
+        data.boost_initial = strength
+        data.boost_set_at = now
+        data.boost_until = now + self._config.boost_duration * 60
+
+        if data.auto_adjust_factor > 1.0:
             data.auto_adjust_factor = max(1.0, data.auto_adjust_factor / 1.2)
         data.dirty = True
         self._dirty_groups.add(group_id)
@@ -243,6 +271,9 @@ class StateManager:
         data.auto_adjust_factor = 1.0
         data.consecutive_replies = 0
         data.skip_history.clear()
+        data.boost_initial = 1.0
+        data.boost_set_at = 0.0
+        data.boost_until = 0.0
         data.dirty = True
         self._dirty_groups.add(group_id)
 
@@ -332,6 +363,9 @@ class StateManager:
                 "user_ttls": data.follow_up.user_ttls,
             },
             "willingness": data.willingness,
+            "boost_initial": data.boost_initial,
+            "boost_set_at": data.boost_set_at,
+            "boost_until": data.boost_until,
         }
 
     def _deserialize_group(self, d: dict[str, Any]) -> GroupStateData:
@@ -363,6 +397,9 @@ class StateManager:
             skip_history=deque(d.get("skip_history", []), maxlen=20),
             follow_up=follow_up,
             willingness=willingness,
+            boost_initial=d.get("boost_initial", 1.0),
+            boost_set_at=d.get("boost_set_at", 0.0),
+            boost_until=d.get("boost_until", 0.0),
         )
 
     def get_status_text(self, group_id: str) -> str:
@@ -371,6 +408,7 @@ class StateManager:
         data = self.get_state(group_id)
         effective_n, effective_t = self.get_effective_thresholds(group_id)
         backoff_factor = BACKOFF_BASE ** data.backoff_level
+        current_boost = self._current_boost(data)
         lines = [
             f"群 {group_id} 状态:",
             f"  状态机: {data.state.value}",
@@ -378,11 +416,16 @@ class StateManager:
             f"  消息计数: {data.msg_count}/{effective_n}",
             f"  退避等级: {data.backoff_level} (×{backoff_factor:.2f})",
             f"  自动调整倍率: {data.auto_adjust_factor:.1f}",
+            f"  频率提升: ×{current_boost:.2f}" + (f" (初始×{data.boost_initial:.2f})" if current_boost < 1.0 else ""),
+            f"  连续回复: {data.consecutive_replies}",
             f"  有效阈值: N={effective_n}, T={effective_t}分钟",
         ]
         if data.state == GroupState.COOLDOWN:
             remaining = max(0, data.cooldown_until - time.time())
             lines.append(f"  冷却剩余: {remaining / 60:.1f} 分钟")
+        if current_boost < 1.0:
+            remaining = max(0, data.boost_until - time.time())
+            lines.append(f"  Boost 剩余: {remaining / 60:.1f} 分钟")
         if data.follow_up.user_ids:
             lines.append(f"  跟进用户: {', '.join(data.follow_up.user_ids)}")
         return "\n".join(lines)
