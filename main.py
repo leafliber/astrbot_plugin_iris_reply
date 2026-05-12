@@ -9,7 +9,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-sys.path.insert(0, str(Path(__file__).parent))
+_plugin_dir = str(Path(__file__).parent)
+if _plugin_dir not in sys.path:
+    sys.path.insert(0, _plugin_dir)
 
 from astrbot.api import logger
 from astrbot.api.event.filter import (
@@ -43,7 +45,6 @@ class DetectionResult:
 
 
 class IrisReply(Star):
-    """Iris Reply - 信号驱动的群聊主动回复插件"""
 
     def __init__(self, context: Context, config: dict | None = None) -> None:
         super().__init__(context, config)
@@ -81,14 +82,22 @@ class IrisReply(Star):
             await asyncio.sleep(self._save_interval)
             try:
                 await self._state.save_dirty(self._kv_save)
+                self._sliding_window.cleanup(self._state.get_whitelist())
             except Exception as e:
-                logger.warning(f"Iris Reply: periodic save error: {e}")
+                logger.warning("Iris Reply: periodic save error: %s", e)
 
     async def _kv_save(self, key: str, value: Any) -> None:
         await self.put_kv_data(key, value)
 
     async def _kv_load(self, key: str) -> Any:
         return await self.get_kv_data(key, None)
+
+    def _get_group_id(self, event) -> str | None:
+        group_id = event.get_group_id()
+        if not group_id:
+            event.set_result("无法获取群ID")
+            return None
+        return group_id
 
     @llm_tool(name="add_follow_up")
     async def tool_add_follow_up(self, event, user_ids: str = "") -> str:
@@ -106,9 +115,12 @@ class IrisReply(Star):
         if not uid_list:
             return "error: must provide at least one user_id"
 
+        if len(uid_list) > 10:
+            return "error: too many user_ids (max 10 per call)"
+
         async with self._state.get_lock(group_id):
             self._state.add_follow_up(group_id, user_ids=uid_list)
-        logger.debug(f"Iris Reply: add_follow_up for group {group_id}, users={uid_list}")
+        logger.debug("Iris Reply: add_follow_up for group %s, users=%s", group_id, uid_list)
         return f"ok: following users={uid_list}"
 
     @llm_tool(name="end_follow_up")
@@ -126,7 +138,7 @@ class IrisReply(Star):
 
         async with self._state.get_lock(group_id):
             self._state.remove_follow_up(group_id, user_ids=uid_list)
-        logger.debug(f"Iris Reply: end_follow_up for group {group_id}, users={uid_list}")
+        logger.debug("Iris Reply: end_follow_up for group %s, users=%s", group_id, uid_list)
         return f"ok: removed follow-up users={uid_list}"
 
     @llm_tool(name="set_cooldown")
@@ -140,12 +152,10 @@ class IrisReply(Star):
         if not group_id:
             return "error: no group context"
 
-        minutes = max(1, min(120, int(minutes)))
-
         async with self._state.get_lock(group_id):
             self._state.set_cooldown(group_id, minutes)
-        logger.debug(f"Iris Reply: set_cooldown for group {group_id}, {minutes} min")
-        return f"ok: cooldown set for {minutes} minutes"
+        logger.debug("Iris Reply: set_cooldown for group %s, %d min", group_id, minutes)
+        return f"ok: cooldown set for {max(1, min(120, int(minutes)))} minutes"
 
     @command_group("iris_reply")
     @permission_type(PermissionType.ADMIN)
@@ -155,38 +165,36 @@ class IrisReply(Star):
 
     @iris.command("enable")
     async def cmd_enable(self, event) -> None:
-        group_id = event.get_group_id()
+        group_id = self._get_group_id(event)
         if not group_id:
-            event.set_result("无法获取群ID")
             return
         self._state.add_to_whitelist(group_id)
-        await self._state.save_all(self._kv_save)
+        await self._state.save_dirty(self._kv_save)
         event.set_result(f"群 {group_id} 已启用 Iris Reply")
 
     @iris.command("disable")
     async def cmd_disable(self, event) -> None:
-        group_id = event.get_group_id()
+        group_id = self._get_group_id(event)
         if not group_id:
-            event.set_result("无法获取群ID")
             return
         self._state.remove_from_whitelist(group_id)
-        await self._state.save_all(self._kv_save)
+        self._sliding_window.remove_group(group_id)
+        self._state.remove_group_lock(group_id)
+        await self._state.save_dirty(self._kv_save)
         event.set_result(f"群 {group_id} 已禁用 Iris Reply")
 
     @iris.command("status")
     async def cmd_status(self, event) -> None:
-        group_id = event.get_group_id()
+        group_id = self._get_group_id(event)
         if not group_id:
-            event.set_result("无法获取群ID")
             return
         text = self._admin.get_status(group_id)
         event.set_result(text)
 
     @iris.command("reset")
     async def cmd_reset(self, event) -> None:
-        group_id = event.get_group_id()
+        group_id = self._get_group_id(event)
         if not group_id:
-            event.set_result("无法获取群ID")
             return
         msg = self._admin.reset_group(group_id)
         await self._state.save_dirty(self._kv_save)
@@ -194,9 +202,8 @@ class IrisReply(Star):
 
     @iris.command("cooldown")
     async def cmd_cooldown(self, event, minutes: int = 5) -> None:
-        group_id = event.get_group_id()
+        group_id = self._get_group_id(event)
         if not group_id:
-            event.set_result("无法获取群ID")
             return
         msg = self._admin.set_cooldown(group_id, minutes)
         await self._state.save_dirty(self._kv_save)
@@ -204,9 +211,8 @@ class IrisReply(Star):
 
     @iris.command("willingness")
     async def cmd_willingness(self, event, level: str = "") -> None:
-        group_id = event.get_group_id()
+        group_id = self._get_group_id(event)
         if not group_id:
-            event.set_result("无法获取群ID")
             return
         if not level.strip():
             current = self._admin.get_willingness(group_id)
@@ -252,21 +258,27 @@ class IrisReply(Star):
         if not trigger_reason:
             return
 
+        if not self._state.can_detect(group_id):
+            logger.debug("Iris Reply: detection rate-limited for group %s", group_id)
+            return
+
         if group_id in self._detecting:
-            logger.debug(f"Iris Reply: detection already in progress for group {group_id}")
+            logger.debug("Iris Reply: detection already in progress for group %s", group_id)
             return
 
         self._detecting.add(group_id)
         try:
             await self._detect_and_trigger(event, group_id, trigger_reason)
         except Exception as e:
-            logger.error(f"Iris Reply: detection error for group {group_id}: {e}", exc_info=True)
+            logger.error("Iris Reply: detection error for group %s: %s", group_id, e, exc_info=True)
         finally:
             self._detecting.discard(group_id)
 
     async def _detect_and_trigger(
         self, event, group_id: str, trigger_reason: str
     ) -> None:
+        self._state.record_detect_time(group_id)
+
         messages = self._sliding_window.get_messages(group_id)
         context_text = self._context_packager.package(group_id, messages, trigger_reason)
 
@@ -277,7 +289,7 @@ class IrisReply(Star):
                     event.unified_msg_origin
                 )
             except Exception:
-                logger.error(f"Iris Reply: failed to get provider ID for group {group_id}")
+                logger.error("Iris Reply: failed to get provider ID for group %s", group_id)
                 return
 
         willingness = self._state.get_willingness(group_id)
@@ -291,7 +303,7 @@ class IrisReply(Star):
                 system_prompt=prompts["detection_system"],
             )
         except Exception as e:
-            logger.error(f"Iris Reply: detection LLM call failed for group {group_id}: {e}")
+            logger.error("Iris Reply: detection LLM call failed for group %s: %s", group_id, e)
             return
 
         completion = response.completion_text or ""
@@ -301,15 +313,15 @@ class IrisReply(Star):
             async with self._state.get_lock(group_id):
                 self._state.add_follow_up(group_id, user_ids=result.follow_up_users)
             logger.info(
-                f"Iris Reply: detection follow-up for group {group_id}, "
-                f"users={result.follow_up_users}, reason={result.interest_reason}"
+                "Iris Reply: detection follow-up for group %s, users=%s, reason=%s",
+                group_id, result.follow_up_users, result.interest_reason,
             )
 
         if not result.should_reply:
             async with self._state.get_lock(group_id):
                 self._state.record_skip_reply(group_id)
             await self._state.save_dirty(self._kv_save)
-            logger.debug(f"Iris Reply: detection skip for group {group_id}")
+            logger.debug("Iris Reply: detection skip for group %s", group_id)
             return
 
         self._iris_context[group_id] = context_text
@@ -318,7 +330,7 @@ class IrisReply(Star):
         if provider_id:
             event.set_extra("selected_provider", provider_id)
         self._tool_ctx.set_context(group_id)
-        logger.info(f"Iris Reply: detection passed ({trigger_reason}), triggering standard pipeline for group {group_id}")
+        logger.info("Iris Reply: detection passed (%s), triggering standard pipeline for group %s", trigger_reason, group_id)
 
     @on_llm_request()
     async def handle_llm_request(self, event, request: ProviderRequest) -> None:
@@ -326,14 +338,17 @@ class IrisReply(Star):
         if not group_id or group_id not in self._iris_context:
             return
 
-        context_text = self._iris_context.pop(group_id)
+        context_text = self._iris_context.pop(group_id, None)
+        if context_text is None:
+            return
+
         willingness = self._state.get_willingness(group_id)
         persona = WILLINGNESS_PROMPTS[willingness]["persona"]
         combined = f"{persona}\n\n{context_text}"
 
         request.extra_user_content_parts.append(TextPart(text=combined))
 
-        logger.debug(f"Iris Reply: injected context for group {group_id}")
+        logger.debug("Iris Reply: injected context for group %s", group_id)
 
     @on_llm_response()
     async def handle_llm_response(self, event, response: LLMResponse) -> None:
@@ -348,7 +363,7 @@ class IrisReply(Star):
 
         self._tool_ctx.clear_context()
         await self._state.save_dirty(self._kv_save)
-        logger.debug(f"Iris Reply: actual reply for group {group_id}")
+        logger.debug("Iris Reply: actual reply for group %s", group_id)
 
     @staticmethod
     def _parse_detection(text: str) -> DetectionResult:
@@ -383,6 +398,8 @@ class IrisReply(Star):
         follow_up_users = []
         if isinstance(follow_up_raw, list):
             follow_up_users = [str(u).strip() for u in follow_up_raw if str(u).strip()]
+            if len(follow_up_users) > 10:
+                follow_up_users = follow_up_users[:10]
         interest_reason = str(obj.get("interest_reason", ""))
 
         return DetectionResult(

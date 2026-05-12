@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -47,12 +48,15 @@ class GroupStateData:
     boost_initial: float = 1.0
     boost_set_at: float = 0.0
     boost_until: float = 0.0
+    last_detect_time: float = 0.0
     dirty: bool = False
 
 
 class StateManager:
     N_MAX = 120
     T_MAX = 300
+    MAX_FOLLOW_UP_USERS = 20
+    DETECT_MIN_INTERVAL = 60.0
 
     def __init__(self, config: ConfigManager) -> None:
         self._config = config
@@ -63,9 +67,14 @@ class StateManager:
         self._whitelist: set[str] = set()
 
     def get_lock(self, group_id: str) -> asyncio.Lock:
-        if group_id not in self._locks:
-            self._locks[group_id] = asyncio.Lock()
-        return self._locks[group_id]
+        return self._locks.setdefault(group_id, asyncio.Lock())
+
+    def remove_group_lock(self, group_id: str) -> None:
+        self._locks.pop(group_id, None)
+
+    def _mark_dirty(self, group_id: str, data: GroupStateData) -> None:
+        data.dirty = True
+        self._dirty_groups.add(group_id)
 
     def _ensure_group(self, group_id: str) -> GroupStateData:
         if group_id not in self._groups:
@@ -79,21 +88,20 @@ class StateManager:
         now = time.time()
         if data.state == GroupState.COOLDOWN and now >= data.cooldown_until:
             data.state = GroupState.IDLE
-            data.dirty = True
-            self._dirty_groups.add(group_id)
+            self._mark_dirty(group_id, data)
         if data.state == GroupState.FOLLOWING:
             self._cleanup_expired_follow(group_id, data, now)
             if not data.follow_up.user_ids:
                 data.state = GroupState.IDLE
-                data.dirty = True
-                self._dirty_groups.add(group_id)
+                self._mark_dirty(group_id, data)
         return data
 
     def is_muted(self) -> bool:
         now = time.localtime()
         current_mins = now.tm_hour * 60 + now.tm_min
-        start_mins = self._config.mute_start_hour * 60 + self._config.mute_start_minute
-        end_mins = self._config.mute_end_hour * 60 + self._config.mute_end_minute
+        start_hour, start_minute, end_hour, end_minute = self._config.mute_period
+        start_mins = start_hour * 60 + start_minute
+        end_mins = end_hour * 60 + end_minute
         if start_mins <= end_mins:
             return start_mins <= current_mins < end_mins
         return current_mins >= start_mins or current_mins < end_mins
@@ -103,8 +111,7 @@ class StateManager:
         minutes = max(1, min(120, minutes))
         data.state = GroupState.COOLDOWN
         data.cooldown_until = time.time() + minutes * 60
-        data.dirty = True
-        self._dirty_groups.add(group_id)
+        self._mark_dirty(group_id, data)
 
     def add_follow_up(
         self,
@@ -116,6 +123,8 @@ class StateManager:
         ttl = self._config.follow_up_ttl * 60
         if user_ids:
             for uid in user_ids:
+                if len(data.follow_up.user_ids) >= self.MAX_FOLLOW_UP_USERS:
+                    break
                 data.follow_up.user_ids.add(uid)
                 data.follow_up.user_ttls[uid] = now + ttl
         data.state = GroupState.FOLLOWING
@@ -123,8 +132,7 @@ class StateManager:
         data.backoff_level = 0
         data.auto_adjust_factor = 1.0
         data.consecutive_replies = 0
-        data.dirty = True
-        self._dirty_groups.add(group_id)
+        self._mark_dirty(group_id, data)
 
     def remove_follow_up(
         self,
@@ -138,8 +146,7 @@ class StateManager:
                 data.follow_up.user_ttls.pop(uid, None)
         if not data.follow_up.user_ids:
             data.state = GroupState.IDLE
-        data.dirty = True
-        self._dirty_groups.add(group_id)
+        self._mark_dirty(group_id, data)
 
     def _cleanup_expired_follow(self, group_id: str, data: GroupStateData, now: float) -> None:
         expired_users = [uid for uid, ttl in data.follow_up.user_ttls.items() if now >= ttl]
@@ -147,8 +154,7 @@ class StateManager:
             data.follow_up.user_ids.discard(uid)
             data.follow_up.user_ttls.pop(uid, None)
         if expired_users:
-            data.dirty = True
-            self._dirty_groups.add(group_id)
+            self._mark_dirty(group_id, data)
 
     def match_follow_up(self, group_id: str, sender_id: str) -> bool:
         data = self.get_state(group_id)
@@ -159,8 +165,7 @@ class StateManager:
     def increment_msg_count(self, group_id: str) -> int:
         data = self._ensure_group(group_id)
         data.msg_count += 1
-        data.dirty = True
-        self._dirty_groups.add(group_id)
+        self._mark_dirty(group_id, data)
         return data.msg_count
 
     def _current_boost(self, data: GroupStateData) -> float:
@@ -210,8 +215,7 @@ class StateManager:
         data = self._ensure_group(group_id)
         data.msg_count = 0
         data.last_sample_time = time.time()
-        data.dirty = True
-        self._dirty_groups.add(group_id)
+        self._mark_dirty(group_id, data)
 
     def record_skip_reply(self, group_id: str) -> None:
         data = self._ensure_group(group_id)
@@ -220,8 +224,7 @@ class StateManager:
         data.consecutive_replies = 0
         data.skip_history.append(time.time())
         self._check_auto_adjust(group_id, data)
-        data.dirty = True
-        self._dirty_groups.add(group_id)
+        self._mark_dirty(group_id, data)
 
     def record_actual_reply(self, group_id: str) -> None:
         data = self._ensure_group(group_id)
@@ -236,8 +239,6 @@ class StateManager:
             strength = 1.0 - (1.0 - self._config.boost_factor) * max(0.0, 1.0 - over / max_br)
         else:
             strength = 1.0
-            if data.backoff_level < MAX_BACKOFF_LEVEL:
-                data.backoff_level = min(data.backoff_level + 1, MAX_BACKOFF_LEVEL)
 
         now = time.time()
         data.boost_initial = strength
@@ -246,8 +247,7 @@ class StateManager:
 
         if data.auto_adjust_factor > 1.0:
             data.auto_adjust_factor = max(1.0, data.auto_adjust_factor / 1.2)
-        data.dirty = True
-        self._dirty_groups.add(group_id)
+        self._mark_dirty(group_id, data)
 
     def _check_auto_adjust(self, group_id: str, data: GroupStateData) -> None:
         now = time.time()
@@ -263,6 +263,15 @@ class StateManager:
             if test_n <= self.N_MAX and test_t <= self.T_MAX:
                 data.auto_adjust_factor = new_factor
 
+    def can_detect(self, group_id: str) -> bool:
+        data = self._ensure_group(group_id)
+        now = time.time()
+        return (now - data.last_detect_time) >= self.DETECT_MIN_INTERVAL
+
+    def record_detect_time(self, group_id: str) -> None:
+        data = self._ensure_group(group_id)
+        data.last_detect_time = time.time()
+
     def reset_group(self, group_id: str) -> None:
         data = self._ensure_group(group_id)
         data.msg_count = 0
@@ -274,20 +283,22 @@ class StateManager:
         data.boost_initial = 1.0
         data.boost_set_at = 0.0
         data.boost_until = 0.0
-        data.dirty = True
-        self._dirty_groups.add(group_id)
+        data.last_detect_time = 0.0
+        self._mark_dirty(group_id, data)
 
     async def save_dirty(self, save_fn) -> None:
         async with self._global_lock:
+            processed = set()
             for gid in list(self._dirty_groups):
                 data = self._groups.get(gid)
                 if data and data.dirty:
                     try:
                         await save_fn(f"state:{gid}", self._serialize_group(data))
                         data.dirty = False
+                        processed.add(gid)
                     except Exception as e:
-                        logger.warning(f"Iris Reply: KV save failed for group {gid}: {e}")
-            self._dirty_groups.clear()
+                        logger.warning("Iris Reply: KV save failed for group %s: %s", gid, e)
+            self._dirty_groups -= processed
 
     def get_willingness(self, group_id: str) -> str:
         data = self._ensure_group(group_id)
@@ -300,8 +311,7 @@ class StateManager:
             return
         data = self._ensure_group(group_id)
         data.willingness = level
-        data.dirty = True
-        self._dirty_groups.add(group_id)
+        self._mark_dirty(group_id, data)
 
     def is_whitelisted(self, group_id: str) -> bool:
         return group_id in self._whitelist
@@ -321,7 +331,7 @@ class StateManager:
             if wl_data and isinstance(wl_data, list):
                 self._whitelist = set(str(g) for g in wl_data)
         except Exception as e:
-            logger.warning(f"Iris Reply: whitelist KV load failed: {e}")
+            logger.warning("Iris Reply: whitelist KV load failed: %s", e)
         try:
             all_data = await load_fn("iris_reply:all_groups")
             if not all_data or not isinstance(all_data, dict):
@@ -329,14 +339,14 @@ class StateManager:
             for gid, gdata in all_data.items():
                 self._groups[gid] = self._deserialize_group(gdata)
         except Exception as e:
-            logger.warning(f"Iris Reply: KV load failed, running in memory-only mode: {e}")
+            logger.warning("Iris Reply: KV load failed, running in memory-only mode: %s", e)
 
     async def save_all(self, save_fn) -> None:
         async with self._global_lock:
             try:
                 await save_fn("iris_reply:whitelist", list(self._whitelist))
             except Exception as e:
-                logger.warning(f"Iris Reply: whitelist KV save failed: {e}")
+                logger.warning("Iris Reply: whitelist KV save failed: %s", e)
             all_data = {}
             for gid, data in self._groups.items():
                 all_data[gid] = self._serialize_group(data)
@@ -344,7 +354,7 @@ class StateManager:
             try:
                 await save_fn("iris_reply:all_groups", all_data)
             except Exception as e:
-                logger.warning(f"Iris Reply: KV save all failed: {e}")
+                logger.warning("Iris Reply: KV save all failed: %s", e)
             self._dirty_groups.clear()
 
     def _serialize_group(self, data: GroupStateData) -> dict[str, Any]:
@@ -366,11 +376,10 @@ class StateManager:
             "boost_initial": data.boost_initial,
             "boost_set_at": data.boost_set_at,
             "boost_until": data.boost_until,
+            "last_detect_time": data.last_detect_time,
         }
 
     def _deserialize_group(self, d: dict[str, Any]) -> GroupStateData:
-        import math
-
         follow_up = FollowUpEntry(
             user_ids=set(d.get("follow_up", {}).get("user_ids", [])),
             user_ttls=d.get("follow_up", {}).get("user_ttls", {}),
@@ -400,6 +409,7 @@ class StateManager:
             boost_initial=d.get("boost_initial", 1.0),
             boost_set_at=d.get("boost_set_at", 0.0),
             boost_until=d.get("boost_until", 0.0),
+            last_detect_time=d.get("last_detect_time", 0.0),
         )
 
     def get_status_text(self, group_id: str) -> str:

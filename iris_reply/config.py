@@ -29,34 +29,41 @@ class ConfigManager:
         self._cfg = config
 
     def _get(self, key: str, default=None):
-        val = self._cfg.get(key, default)
-        if val is None:
-            return _DEFAULTS.get(key, default)
-        return val
+        val = self._cfg.get(key)
+        if val is not None:
+            return val
+        return _DEFAULTS.get(key, default)
 
     @property
     def enabled(self) -> bool:
         return bool(self._get("enabled", True))
 
     @property
-    def mute_start_hour(self) -> int:
+    def mute_period(self) -> tuple[int, int, int, int]:
         mp = self._get("mute_period", {})
-        return int(mp.get("start_hour", _DEFAULTS["mute_period"]["start_hour"]))
+        dmp = _DEFAULTS["mute_period"]
+        return (
+            int(mp.get("start_hour", dmp["start_hour"])),
+            int(mp.get("start_minute", dmp["start_minute"])),
+            int(mp.get("end_hour", dmp["end_hour"])),
+            int(mp.get("end_minute", dmp["end_minute"])),
+        )
+
+    @property
+    def mute_start_hour(self) -> int:
+        return self.mute_period[0]
 
     @property
     def mute_start_minute(self) -> int:
-        mp = self._get("mute_period", {})
-        return int(mp.get("start_minute", _DEFAULTS["mute_period"]["start_minute"]))
+        return self.mute_period[1]
 
     @property
     def mute_end_hour(self) -> int:
-        mp = self._get("mute_period", {})
-        return int(mp.get("end_hour", _DEFAULTS["mute_period"]["end_hour"]))
+        return self.mute_period[2]
 
     @property
     def mute_end_minute(self) -> int:
-        mp = self._get("mute_period", {})
-        return int(mp.get("end_minute", _DEFAULTS["mute_period"]["end_minute"]))
+        return self.mute_period[3]
 
     @property
     def window_size(self) -> int:
@@ -64,11 +71,11 @@ class ConfigManager:
 
     @property
     def default_n(self) -> int:
-        return max(5, min(120, int(self._get("default_n", 15))))
+        return max(5, min(120, int(self._get("default_n", 30))))
 
     @property
     def default_t(self) -> int:
-        return max(5, min(180, int(self._get("default_t", 30))))
+        return max(5, min(180, int(self._get("default_t", 65))))
 
     @property
     def max_token(self) -> int:
@@ -76,7 +83,7 @@ class ConfigManager:
 
     @property
     def follow_up_ttl(self) -> int:
-        return max(5, min(120, int(self._get("follow_up_ttl", 30))))
+        return max(5, min(120, int(self._get("follow_up_ttl", 5))))
 
     @property
     def quality_threshold(self) -> float:

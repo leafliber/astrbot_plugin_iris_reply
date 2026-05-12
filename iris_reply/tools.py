@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+import contextvars
+
 
 class ToolContext:
-    def __init__(self) -> None:
-        self._current_group_id: str | None = None
+    _ctx_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+        "iris_tool_group_id", default=None
+    )
 
     def set_context(self, group_id: str) -> None:
-        self._current_group_id = group_id
+        self._ctx_var.set(group_id)
 
     def clear_context(self) -> None:
-        self._current_group_id = None
+        self._ctx_var.set(None)
 
     @property
     def current_group_id(self) -> str | None:
-        return self._current_group_id
+        return self._ctx_var.get()

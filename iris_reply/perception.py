@@ -5,6 +5,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
+from xml.sax.saxutils import quoteattr
 
 import tiktoken
 
@@ -15,6 +16,9 @@ from .state import StateManager
 
 if TYPE_CHECKING:
     from astrbot.api.event import AstrMessageEvent
+
+_RE_DIGITS_ONLY = re.compile(r"[\d\s]+")
+_RE_NONALNUM_ONLY = re.compile(r"[\W_]+")
 
 
 @dataclass
@@ -49,11 +53,11 @@ class Gatekeeper:
         if not text or not text.strip():
             return 0.0
         stripped = text.strip()
-        if re.fullmatch(r"[\d\s]+", stripped):
+        if _RE_DIGITS_ONLY.fullmatch(stripped):
             return 0.1
         if len(stripped) <= 2:
             return 0.2
-        if re.fullmatch(r"[\W_]+", stripped):
+        if _RE_NONALNUM_ONLY.fullmatch(stripped):
             return 0.1
         alpha_count = sum(1 for c in stripped if c.isalnum() or "\u4e00" <= c <= "\u9fff")
         ratio = alpha_count / len(stripped) if stripped else 0
@@ -78,6 +82,14 @@ class SlidingWindow:
         window = self._ensure_window(group_id)
         return list(window)
 
+    def remove_group(self, group_id: str) -> None:
+        self._windows.pop(group_id, None)
+
+    def cleanup(self, active_group_ids: set[str]) -> None:
+        stale = [gid for gid in self._windows if gid not in active_group_ids]
+        for gid in stale:
+            del self._windows[gid]
+
 
 class ContextPackager:
     def __init__(self, config: ConfigManager) -> None:
@@ -85,7 +97,7 @@ class ContextPackager:
         try:
             self._encoding = tiktoken.get_encoding("cl100k_base")
         except Exception as e:
-            logger.warning(f"Iris Reply: tiktoken init failed, falling back to char estimate: {e}")
+            logger.warning("Iris Reply: tiktoken init failed, falling back to char estimate: %s", e)
             self._encoding = None
 
     def _count_tokens(self, text: str) -> int:
@@ -99,19 +111,25 @@ class ContextPackager:
         messages: list[WindowMessage],
         trigger_reason: str,
     ) -> str:
-        lines = []
+        lines: list[str] = []
+        token_counts: list[int] = []
         for msg in messages:
-            lines.append(f"[{msg.sender_name}({msg.sender_id})] {msg.content}")
-        context_text = "\n".join(lines)
+            line = f"[{msg.sender_name}({msg.sender_id})] {msg.content}"
+            tc = self._count_tokens(line)
+            lines.append(line)
+            token_counts.append(tc)
 
-        total_tokens = self._count_tokens(context_text)
+        total_tokens = sum(token_counts)
         max_tokens = self._config.max_token
 
-        while total_tokens > max_tokens and lines:
-            lines.pop(0)
-            context_text = "\n".join(lines)
-            total_tokens = self._count_tokens(context_text)
+        start = 0
+        while total_tokens > max_tokens and start < len(lines):
+            total_tokens -= token_counts[start]
+            start += 1
 
-        header = f"<iris_context trigger_reason=\"{trigger_reason}\">\n"
+        context_text = "\n".join(lines[start:])
+
+        escaped_reason = quoteattr(trigger_reason)
+        header = f"<iris_context trigger_reason={escaped_reason}>\n"
         footer = "\n</iris_context>"
         return header + context_text + footer

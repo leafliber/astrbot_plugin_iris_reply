@@ -94,7 +94,9 @@ WILLINGNESS_PROMPTS = {
 
 
 def resolve_level(raw: str) -> str | None:
-    return _INPUT_MAP.get(raw.strip().lower()) or _INPUT_MAP.get(raw.strip())
+    stripped = raw.strip()
+    lower = stripped.lower()
+    return _INPUT_MAP.get(lower) or _INPUT_MAP.get(stripped)
 
 
 def display_level(level: str) -> str:
