@@ -36,19 +36,19 @@
   "window_size": {
     "description": "滑动记忆窗口大小（条数）",
     "type": "int",
-    "default": 10,
+    "default": 15,
     "hint": "保留最近 N 条有效发言，范围 5-30"
   },
   "default_n": {
     "description": "默认消息计数阈值 N",
     "type": "int",
-    "default": 30,
+    "default": 15,
     "hint": "每收到 N 条有效消息触发一次采样，范围 5-120"
   },
   "default_t": {
     "description": "默认时间间隔阈值 T（分钟）",
     "type": "int",
-    "default": 65,
+    "default": 30,
     "hint": "距上次采样超过 T 分钟且有新消息时触发，范围 5-180"
   },
   "max_token": {
@@ -60,13 +60,13 @@
   "follow_up_ttl": {
     "description": "跟进注册表默认 TTL（分钟）",
     "type": "int",
-    "default": 5,
+    "default": 10,
     "hint": "动态跟进记录的存活时长，范围 5-120"
   },
   "quality_threshold": {
     "description": "消息质量评分阈值",
     "type": "float",
-    "default": 0.3,
+    "default": 0.2,
     "hint": "低于此阈值的消息不进入滑动窗口，范围 0.0-1.0"
   },
   "provider_id": {
@@ -78,19 +78,19 @@
   "boost_factor": {
     "description": "回复后频率提升系数",
     "type": "float",
-    "default": 0.7,
+    "default": 0.6,
     "hint": "Iris 回复后有效阈值临时乘以此系数（<1.0 降低阈值），范围 0.3-0.95"
   },
   "boost_duration": {
     "description": "频率提升持续时间（分钟）",
     "type": "int",
-    "default": 10,
+    "default": 15,
     "hint": "回复后 boost 效果的持续时间，之后线性衰减回正常，范围 1-60"
   },
   "max_boosted_replies": {
     "description": "最大连续回复 boost 次数",
     "type": "int",
-    "default": 3,
+    "default": 5,
     "hint": "连续回复不超过此次数时享受完整 boost，超出后逐渐减弱，范围 2-10"
   }
 }

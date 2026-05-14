@@ -40,7 +40,9 @@ class GroupStateData:
     msg_count: int = 0
     last_sample_time: float = 0.0
     backoff_level: int = 0
+    last_backoff_time: float = 0.0
     auto_adjust_factor: float = 1.0
+    last_auto_adjust_time: float = 0.0
     consecutive_replies: int = 0
     skip_history: deque = field(default_factory=lambda: deque(maxlen=20))
     follow_up: FollowUpEntry = field(default_factory=FollowUpEntry)
@@ -56,7 +58,9 @@ class StateManager:
     N_MAX = 120
     T_MAX = 300
     MAX_FOLLOW_UP_USERS = 20
-    DETECT_MIN_INTERVAL = 60.0
+    DETECT_MIN_INTERVAL = 30.0
+    BACKOFF_DECAY_INTERVAL = 300.0
+    AUTO_ADJUST_DECAY_INTERVAL = 600.0
 
     def __init__(self, config: ConfigManager) -> None:
         self._config = config
@@ -179,8 +183,32 @@ class StateManager:
         progress = min(1.0, elapsed / total)
         return data.boost_initial + (1.0 - data.boost_initial) * progress
 
+    def _decay_backoff(self, group_id: str, data: GroupStateData, now: float) -> None:
+        if data.backoff_level <= 0 or data.last_backoff_time <= 0:
+            return
+        elapsed = now - data.last_backoff_time
+        levels_to_decay = int(elapsed / self.BACKOFF_DECAY_INTERVAL)
+        if levels_to_decay > 0:
+            data.backoff_level = max(0, data.backoff_level - levels_to_decay)
+            data.last_backoff_time = now
+            self._mark_dirty(group_id, data)
+
+    def _decay_auto_adjust(self, group_id: str, data: GroupStateData, now: float) -> None:
+        if data.auto_adjust_factor <= 1.0 or data.last_auto_adjust_time <= 0:
+            return
+        elapsed = now - data.last_auto_adjust_time
+        steps = int(elapsed / self.AUTO_ADJUST_DECAY_INTERVAL)
+        if steps > 0:
+            for _ in range(steps):
+                data.auto_adjust_factor = max(1.0, data.auto_adjust_factor / 1.3)
+            data.last_auto_adjust_time = now
+            self._mark_dirty(group_id, data)
+
     def get_effective_thresholds(self, group_id: str) -> tuple[int, int]:
         data = self._ensure_group(group_id)
+        now = time.time()
+        self._decay_backoff(group_id, data, now)
+        self._decay_auto_adjust(group_id, data, now)
         backoff_factor = BACKOFF_BASE ** data.backoff_level
         boost = self._current_boost(data)
         combined = data.auto_adjust_factor * backoff_factor * boost
@@ -221,8 +249,13 @@ class StateManager:
         data = self._ensure_group(group_id)
         if data.backoff_level < MAX_BACKOFF_LEVEL:
             data.backoff_level += 1
+        now = time.time()
+        if data.last_backoff_time <= 0:
+            data.last_backoff_time = now
+        if data.last_auto_adjust_time <= 0:
+            data.last_auto_adjust_time = now
         data.consecutive_replies = 0
-        data.skip_history.append(time.time())
+        data.skip_history.append(now)
         self._check_auto_adjust(group_id, data)
         self._mark_dirty(group_id, data)
 
@@ -246,7 +279,8 @@ class StateManager:
         data.boost_until = now + self._config.boost_duration * 60
 
         if data.auto_adjust_factor > 1.0:
-            data.auto_adjust_factor = max(1.0, data.auto_adjust_factor / 1.2)
+            data.auto_adjust_factor = max(1.0, data.auto_adjust_factor / 1.5)
+            data.last_auto_adjust_time = now
         self._mark_dirty(group_id, data)
 
     def _check_auto_adjust(self, group_id: str, data: GroupStateData) -> None:
@@ -262,6 +296,7 @@ class StateManager:
             test_t = int(self._config.default_t * new_factor * w_adj["t_factor"])
             if test_n <= self.N_MAX and test_t <= self.T_MAX:
                 data.auto_adjust_factor = new_factor
+                data.last_auto_adjust_time = now
 
     def can_detect(self, group_id: str) -> bool:
         data = self._ensure_group(group_id)
@@ -277,7 +312,9 @@ class StateManager:
         data.msg_count = 0
         data.last_sample_time = time.time()
         data.backoff_level = 0
+        data.last_backoff_time = 0.0
         data.auto_adjust_factor = 1.0
+        data.last_auto_adjust_time = 0.0
         data.consecutive_replies = 0
         data.skip_history.clear()
         data.boost_initial = 1.0
@@ -365,7 +402,9 @@ class StateManager:
             "msg_count": data.msg_count,
             "last_sample_time": data.last_sample_time,
             "backoff_level": data.backoff_level,
+            "last_backoff_time": data.last_backoff_time,
             "auto_adjust_factor": data.auto_adjust_factor,
+            "last_auto_adjust_time": data.last_auto_adjust_time,
             "consecutive_replies": data.consecutive_replies,
             "skip_history": list(data.skip_history),
             "follow_up": {
@@ -394,6 +433,13 @@ class StateManager:
             backoff_level = min(int(math.log2(old_mult)), MAX_BACKOFF_LEVEL)
         else:
             backoff_level = 0
+        last_backoff_time = d.get("last_backoff_time", 0.0)
+        if backoff_level > 0 and last_backoff_time <= 0:
+            last_backoff_time = time.time()
+        auto_adjust_factor = d.get("auto_adjust_factor", 1.0)
+        last_auto_adjust_time = d.get("last_auto_adjust_time", 0.0)
+        if auto_adjust_factor > 1.0 and last_auto_adjust_time <= 0:
+            last_auto_adjust_time = time.time()
         return GroupStateData(
             state=GroupState(d.get("state", "idle")),
             cooldown_until=d.get("cooldown_until", 0.0),
@@ -401,7 +447,9 @@ class StateManager:
             msg_count=d.get("msg_count", 0),
             last_sample_time=d.get("last_sample_time", time.time()),
             backoff_level=backoff_level,
-            auto_adjust_factor=d.get("auto_adjust_factor", 1.0),
+            last_backoff_time=last_backoff_time,
+            auto_adjust_factor=auto_adjust_factor,
+            last_auto_adjust_time=last_auto_adjust_time,
             consecutive_replies=d.get("consecutive_replies", 0),
             skip_history=deque(d.get("skip_history", []), maxlen=20),
             follow_up=follow_up,

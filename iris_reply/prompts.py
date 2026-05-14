@@ -3,7 +3,7 @@ from __future__ import annotations
 VALID_LEVELS = ("low", "medium", "high")
 DEFAULT_LEVEL = "medium"
 
-BACKOFF_BASE = 1.5
+BACKOFF_BASE = 1.3
 MAX_BACKOFF_LEVEL = 5
 
 _DISPLAY = {"low": "低", "medium": "中", "high": "高"}
