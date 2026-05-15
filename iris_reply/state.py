@@ -128,6 +128,7 @@ class StateManager:
         data = self._ensure_group(group_id)
         now = time.time()
         ttl = self._config.follow_up_ttl * 60
+        was_following = data.state == GroupState.FOLLOWING
         if user_ids:
             for uid in user_ids:
                 if len(data.follow_up.user_ids) >= self.MAX_FOLLOW_UP_USERS:
@@ -136,11 +137,12 @@ class StateManager:
                 data.follow_up.user_ttls[uid] = now + ttl
         if reason:
             data.follow_up.reason = reason
-        data.state = GroupState.FOLLOWING
-        data.following_since = now
-        data.backoff_level = 0
-        data.auto_adjust_factor = 1.0
-        data.consecutive_replies = 0
+        if not was_following:
+            data.state = GroupState.FOLLOWING
+            data.following_since = now
+            data.backoff_level = 0
+            data.auto_adjust_factor = 1.0
+            data.consecutive_replies = 0
         self._mark_dirty(group_id, data)
 
     def remove_follow_up(
@@ -360,6 +362,13 @@ class StateManager:
         data.boost_set_at = 0.0
         data.boost_until = 0.0
         data.last_detect_time = 0.0
+        data.last_summary_time = 0.0
+        data.follow_up.user_ids.clear()
+        data.follow_up.user_ttls.clear()
+        data.follow_up.reason = ""
+        data.follow_up.patience_count = 0
+        data.following_since = 0.0
+        data.state = GroupState.IDLE
         self._mark_dirty(group_id, data)
 
     async def save_dirty(self, save_fn) -> None:
@@ -530,5 +539,8 @@ class StateManager:
             remaining = max(0, data.boost_until - time.time())
             lines.append(f"  Boost 剩余: {remaining / 60:.1f} 分钟")
         if data.follow_up.user_ids:
-            lines.append(f"  跟进用户: {', '.join(data.follow_up.user_ids)}")
+            lines.append(f"  跟进用户: {', '.join(sorted(data.follow_up.user_ids))}")
+            if data.follow_up.reason:
+                lines.append(f"  跟进原因: {data.follow_up.reason}")
+            lines.append(f"  耐心计数: {data.follow_up.patience_count}/{self._config.follow_up_patience}")
         return "\n".join(lines)

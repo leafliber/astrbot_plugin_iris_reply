@@ -279,6 +279,10 @@ class IrisReply(Star):
         if summary_provider:
             asyncio.create_task(self._run_summary(group_id, summary_provider))
 
+        if event.is_at_or_wake_command:
+            self._state.increment_msg_count(group_id)
+            return
+
         async with self._state.get_lock(group_id):
             trigger_reason = self._trigger_engine.evaluate(event)
 
@@ -347,6 +351,8 @@ class IrisReply(Star):
                         user_ids=result.noteworthy_users,
                         reason=result.noteworthy_reason,
                     )
+                elif result.noteworthy and group_state.state == GroupState.FOLLOWING:
+                    self._state.reset_patience(group_id)
                 elif not result.noteworthy and group_state.state == GroupState.FOLLOWING and len(messages) >= 3:
                     patience = self._state.increment_patience(group_id)
                     if patience >= self._config.follow_up_patience:
