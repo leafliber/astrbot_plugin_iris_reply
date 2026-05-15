@@ -307,7 +307,9 @@ class IrisReply(Star):
             return
 
         completion = response.completion_text or ""
+        logger.info("Iris Reply: detection raw response for group %s (len=%d): %.500s", group_id, len(completion), completion)
         result = self._parse_detection(completion)
+        logger.info("Iris Reply: detection parsed for group %s: should_reply=%s, follow_up=%s, reason=%s", group_id, result.should_reply, result.follow_up_users, result.interest_reason)
 
         if result.follow_up_users:
             async with self._state.get_lock(group_id):
@@ -327,15 +329,20 @@ class IrisReply(Star):
         self._iris_context[group_id] = context_text
         self._iris_active.add(group_id)
         event.is_at_or_wake_command = True
+        event.is_wake = True
         if provider_id:
             event.set_extra("selected_provider", provider_id)
         self._tool_ctx.set_context(group_id)
-        logger.info("Iris Reply: detection passed (%s), triggering standard pipeline for group %s", trigger_reason, group_id)
+        logger.info(
+            "Iris Reply: detection passed (%s), triggering standard pipeline for group %s (is_at_or_wake_command=%s, is_wake=%s)",
+            trigger_reason, group_id, event.is_at_or_wake_command, event.is_wake,
+        )
 
     @on_llm_request()
     async def handle_llm_request(self, event, request: ProviderRequest) -> None:
         group_id = event.get_group_id()
         if not group_id or group_id not in self._iris_context:
+            logger.debug("Iris Reply: handle_llm_request skip for group %s (in_context=%s)", group_id, group_id in self._iris_context if group_id else "no_group")
             return
 
         context_text = self._iris_context.pop(group_id, None)
@@ -348,12 +355,13 @@ class IrisReply(Star):
 
         request.extra_user_content_parts.append(TextPart(text=combined))
 
-        logger.debug("Iris Reply: injected context for group %s", group_id)
+        logger.info("Iris Reply: injected context for group %s (willingness=%s)", group_id, willingness)
 
     @on_llm_response()
     async def handle_llm_response(self, event, response: LLMResponse) -> None:
         group_id = event.get_group_id()
         if not group_id or group_id not in self._iris_active:
+            logger.debug("Iris Reply: handle_llm_response skip for group %s (in_active=%s)", group_id, group_id in self._iris_active if group_id else "no_group")
             return
 
         self._iris_active.discard(group_id)
@@ -363,13 +371,16 @@ class IrisReply(Star):
 
         self._tool_ctx.clear_context()
         await self._state.save_dirty(self._kv_save)
-        logger.debug("Iris Reply: actual reply for group %s", group_id)
+        logger.info("Iris Reply: actual reply sent for group %s", group_id)
 
     @staticmethod
     def _parse_detection(text: str) -> DetectionResult:
         match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
         if match:
             text = match.group(1).strip()
+
+        text = re.sub(r"\"should_reply\"\s*:\s*True", '"should_reply": true', text)
+        text = re.sub(r"\"should_reply\"\s*:\s*False", '"should_reply": false', text)
 
         obj = None
         try:
@@ -391,9 +402,17 @@ class IrisReply(Star):
                             start = -1
 
         if not isinstance(obj, dict):
+            logger.warning("Iris Reply: detection JSON parse failed, raw text: %.300s", text)
             return DetectionResult()
 
-        should_reply = bool(obj.get("should_reply", False))
+        raw_should_reply = obj.get("should_reply", False)
+        if isinstance(raw_should_reply, str):
+            should_reply = raw_should_reply.lower() in ("true", "yes", "1")
+        elif isinstance(raw_should_reply, (int, float)):
+            should_reply = bool(raw_should_reply)
+        else:
+            should_reply = bool(raw_should_reply)
+
         follow_up_raw = obj.get("follow_up_users", [])
         follow_up_users = []
         if isinstance(follow_up_raw, list):
