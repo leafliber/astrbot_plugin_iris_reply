@@ -30,6 +30,8 @@ class GroupState(Enum):
 class FollowUpEntry:
     user_ids: set[str] = field(default_factory=set)
     user_ttls: dict[str, float] = field(default_factory=dict)
+    reason: str = ""
+    patience_count: int = 0
 
 
 @dataclass
@@ -51,6 +53,7 @@ class GroupStateData:
     boost_set_at: float = 0.0
     boost_until: float = 0.0
     last_detect_time: float = 0.0
+    last_summary_time: float = 0.0
     dirty: bool = False
 
 
@@ -58,7 +61,6 @@ class StateManager:
     N_MAX = 120
     T_MAX = 300
     MAX_FOLLOW_UP_USERS = 20
-    DETECT_MIN_INTERVAL = 30.0
     BACKOFF_DECAY_INTERVAL = 300.0
     AUTO_ADJUST_DECAY_INTERVAL = 600.0
 
@@ -121,6 +123,7 @@ class StateManager:
         self,
         group_id: str,
         user_ids: list[str] | None = None,
+        reason: str = "",
     ) -> None:
         data = self._ensure_group(group_id)
         now = time.time()
@@ -131,6 +134,8 @@ class StateManager:
                     break
                 data.follow_up.user_ids.add(uid)
                 data.follow_up.user_ttls[uid] = now + ttl
+        if reason:
+            data.follow_up.reason = reason
         data.state = GroupState.FOLLOWING
         data.following_since = now
         data.backoff_level = 0
@@ -165,6 +170,10 @@ class StateManager:
         if data.state == GroupState.COOLDOWN:
             return False
         return sender_id in data.follow_up.user_ids
+
+    def get_follow_up_info(self, group_id: str) -> tuple[set[str], str]:
+        data = self.get_state(group_id)
+        return data.follow_up.user_ids, data.follow_up.reason
 
     def increment_msg_count(self, group_id: str) -> int:
         data = self._ensure_group(group_id)
@@ -301,11 +310,41 @@ class StateManager:
     def can_detect(self, group_id: str) -> bool:
         data = self._ensure_group(group_id)
         now = time.time()
-        return (now - data.last_detect_time) >= self.DETECT_MIN_INTERVAL
+        min_interval = float(self._config.trigger_min_interval)
+        return (now - data.last_detect_time) >= min_interval
 
     def record_detect_time(self, group_id: str) -> None:
         data = self._ensure_group(group_id)
         data.last_detect_time = time.time()
+
+    def can_summarize(self, group_id: str, min_interval: float) -> bool:
+        data = self._ensure_group(group_id)
+        now = time.time()
+        return (now - data.last_summary_time) >= min_interval
+
+    def record_summary_time(self, group_id: str) -> None:
+        data = self._ensure_group(group_id)
+        data.last_summary_time = time.time()
+
+    def increment_patience(self, group_id: str) -> int:
+        data = self._ensure_group(group_id)
+        data.follow_up.patience_count += 1
+        self._mark_dirty(group_id, data)
+        return data.follow_up.patience_count
+
+    def reset_patience(self, group_id: str) -> None:
+        data = self._ensure_group(group_id)
+        data.follow_up.patience_count = 0
+        self._mark_dirty(group_id, data)
+
+    def clear_follow_up(self, group_id: str) -> None:
+        data = self._ensure_group(group_id)
+        data.follow_up.user_ids.clear()
+        data.follow_up.user_ttls.clear()
+        data.follow_up.reason = ""
+        data.follow_up.patience_count = 0
+        data.state = GroupState.IDLE
+        self._mark_dirty(group_id, data)
 
     def reset_group(self, group_id: str) -> None:
         data = self._ensure_group(group_id)
@@ -410,18 +449,23 @@ class StateManager:
             "follow_up": {
                 "user_ids": list(data.follow_up.user_ids),
                 "user_ttls": data.follow_up.user_ttls,
+                "reason": data.follow_up.reason,
+                "patience_count": data.follow_up.patience_count,
             },
             "willingness": data.willingness,
             "boost_initial": data.boost_initial,
             "boost_set_at": data.boost_set_at,
             "boost_until": data.boost_until,
             "last_detect_time": data.last_detect_time,
+            "last_summary_time": data.last_summary_time,
         }
 
     def _deserialize_group(self, d: dict[str, Any]) -> GroupStateData:
         follow_up = FollowUpEntry(
             user_ids=set(d.get("follow_up", {}).get("user_ids", [])),
             user_ttls=d.get("follow_up", {}).get("user_ttls", {}),
+            reason=d.get("follow_up", {}).get("reason", ""),
+            patience_count=d.get("follow_up", {}).get("patience_count", 0),
         )
         willingness = d.get("willingness", DEFAULT_LEVEL)
         if willingness not in VALID_LEVELS:
@@ -458,6 +502,7 @@ class StateManager:
             boost_set_at=d.get("boost_set_at", 0.0),
             boost_until=d.get("boost_until", 0.0),
             last_detect_time=d.get("last_detect_time", 0.0),
+            last_summary_time=d.get("last_summary_time", 0.0),
         )
 
     def get_status_text(self, group_id: str) -> str:

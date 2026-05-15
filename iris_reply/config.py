@@ -16,8 +16,12 @@ _DEFAULTS = {
     "default_t": 30,
     "max_token": 3000,
     "follow_up_ttl": 10,
+    "follow_up_patience": 3,
     "quality_threshold": 0.2,
     "provider_id": "",
+    "summary_provider_id": "",
+    "summary_min_interval": 15,
+    "trigger_min_interval": 30,
     "boost_factor": 0.6,
     "boost_duration": 15,
     "max_boosted_replies": 5,
@@ -36,7 +40,7 @@ class ConfigManager:
 
     @property
     def enabled(self) -> bool:
-        return bool(self._get("enabled", True))
+        return bool(self._get("enabled"))
 
     @property
     def mute_period(self) -> tuple[int, int, int, int]:
@@ -67,40 +71,56 @@ class ConfigManager:
 
     @property
     def window_size(self) -> int:
-        return max(5, min(30, int(self._get("window_size", 10))))
+        return max(5, min(30, int(self._get("window_size"))))
 
     @property
     def default_n(self) -> int:
-        return max(5, min(120, int(self._get("default_n", 30))))
+        return max(5, min(120, int(self._get("default_n"))))
 
     @property
     def default_t(self) -> int:
-        return max(5, min(180, int(self._get("default_t", 65))))
+        return max(5, min(180, int(self._get("default_t"))))
 
     @property
     def max_token(self) -> int:
-        return max(1000, min(8000, int(self._get("max_token", 3000))))
+        return max(1000, min(8000, int(self._get("max_token"))))
 
     @property
     def follow_up_ttl(self) -> int:
-        return max(5, min(120, int(self._get("follow_up_ttl", 5))))
+        return max(5, min(120, int(self._get("follow_up_ttl"))))
+
+    @property
+    def follow_up_patience(self) -> int:
+        return max(1, min(10, int(self._get("follow_up_patience"))))
 
     @property
     def quality_threshold(self) -> float:
-        return max(0.0, min(1.0, float(self._get("quality_threshold", 0.3))))
+        return max(0.0, min(1.0, float(self._get("quality_threshold"))))
 
     @property
     def provider_id(self) -> str:
         return str(self._get("provider_id", ""))
 
     @property
+    def summary_provider_id(self) -> str:
+        return str(self._get("summary_provider_id", ""))
+
+    @property
+    def summary_min_interval(self) -> int:
+        return max(5, min(120, int(self._get("summary_min_interval"))))
+
+    @property
+    def trigger_min_interval(self) -> int:
+        return max(10, min(120, int(self._get("trigger_min_interval"))))
+
+    @property
     def boost_factor(self) -> float:
-        return max(0.3, min(0.95, float(self._get("boost_factor", 0.7))))
+        return max(0.3, min(0.95, float(self._get("boost_factor"))))
 
     @property
     def boost_duration(self) -> int:
-        return max(1, min(60, int(self._get("boost_duration", 10))))
+        return max(1, min(60, int(self._get("boost_duration"))))
 
     @property
     def max_boosted_replies(self) -> int:
-        return max(2, min(10, int(self._get("max_boosted_replies", 3))))
+        return max(2, min(10, int(self._get("max_boosted_replies"))))

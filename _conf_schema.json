@@ -63,6 +63,12 @@
     "default": 10,
     "hint": "动态跟进记录的存活时长，范围 5-120"
   },
+  "follow_up_patience": {
+    "description": "跟进耐心阈值（次）",
+    "type": "int",
+    "default": 3,
+    "hint": "连续多少次总结认为不值得关注后清除跟进记录，范围 1-10"
+  },
   "quality_threshold": {
     "description": "消息质量评分阈值",
     "type": "float",
@@ -70,10 +76,29 @@
     "hint": "低于此阈值的消息不进入滑动窗口，范围 0.0-1.0"
   },
   "provider_id": {
-    "description": "Iris 使用的 LLM 提供商 ID（留空使用默认提供商）",
+    "description": "触发阶段使用的 LLM 提供商 ID（留空使用默认提供商）",
     "type": "string",
     "default": "",
     "_special": "select_provider"
+  },
+  "summary_provider_id": {
+    "description": "总结阶段使用的 LLM 提供商 ID（留空使用默认提供商）",
+    "type": "string",
+    "default": "",
+    "hint": "可配置为轻量模型以节省资源，留空则复用触发阶段的提供商",
+    "_special": "select_provider"
+  },
+  "summary_min_interval": {
+    "description": "总结阶段最小间隔（秒）",
+    "type": "int",
+    "default": 15,
+    "hint": "同一群两次总结之间的最小时间间隔，范围 5-120"
+  },
+  "trigger_min_interval": {
+    "description": "触发阶段最小间隔（秒）",
+    "type": "int",
+    "default": 30,
+    "hint": "同一群两次触发 LLM 调用之间的最小时间间隔，范围 10-120"
   },
   "boost_factor": {
     "description": "回复后频率提升系数",
