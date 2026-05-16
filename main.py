@@ -67,6 +67,7 @@ class IrisReply(Star):
         self._admin = AdminCommands(self._state)
         self._iris_context: dict[str, str] = {}
         self._iris_active: set[str] = set()
+        self._pending_follow_up: dict[str, tuple[list[str], str]] = {}
         self._summary_cache: dict[str, SummaryResult] = {}
         self._summarizing: set[str] = set()
         self._triggering: set[str] = set()
@@ -283,6 +284,10 @@ class IrisReply(Star):
             self._state.increment_msg_count(group_id)
             return
 
+        if group_id in self._iris_active:
+            logger.debug("Iris Reply: reply already in progress for group %s", group_id)
+            return
+
         async with self._state.get_lock(group_id):
             trigger_reason = self._trigger_engine.evaluate(event)
 
@@ -440,10 +445,9 @@ class IrisReply(Star):
             return
 
         if result.follow_up_users:
-            async with self._state.get_lock(group_id):
-                self._state.add_follow_up(group_id, user_ids=result.follow_up_users, reason=result.interest_reason)
+            self._pending_follow_up[group_id] = (result.follow_up_users, result.interest_reason)
             logger.info(
-                "Iris Reply: trigger follow-up for group %s, users=%s, reason=%s",
+                "Iris Reply: trigger follow-up pending for group %s, users=%s, reason=%s",
                 group_id, result.follow_up_users, result.interest_reason,
             )
 
@@ -486,12 +490,29 @@ class IrisReply(Star):
         messages = self._sliding_window.get_messages(group_id)
         context_text = self._context_packager.package(group_id, messages, "reply")
 
-        combined = persona
+        sections = []
+        sections.append(f"<iris:persona>\n{persona}\n</iris:persona>")
         if summary_text:
-            combined += f"\n\n<conversation_summary>{summary_text}</conversation_summary>"
-        combined += "\n\n" + context_text
+            sections.append(f"<iris:conversation_summary>\n{summary_text}\n</iris:conversation_summary>")
+        sections.append(context_text)
 
-        request.extra_user_content_parts.append(TextPart(text=combined))
+        combined = "\n\n".join(sections)
+
+        text_part = TextPart(text=combined)
+        if hasattr(text_part, "mark_as_temp"):
+            text_part.mark_as_temp()
+        request.extra_user_content_parts.append(text_part)
+
+        context_instruction = (
+            "\n\n消息中可能包含 <iris:...> 标签包裹的参考上下文"
+            "（如群聊记录、用户画像、记忆、人设等），"
+            "这些仅供你理解对话背景，绝对不要在你的回复中复述或输出这些上下文内容。"
+            "直接以自然的方式回复用户的消息即可。"
+        )
+        if request.system_prompt:
+            request.system_prompt += context_instruction
+        else:
+            request.system_prompt = context_instruction.strip()
 
         logger.info("Iris Reply: injected context for group %s (willingness=%s)", group_id, willingness)
 
@@ -503,13 +524,18 @@ class IrisReply(Star):
 
         self._iris_active.discard(group_id)
 
+        pending = self._pending_follow_up.pop(group_id, None)
+
         async with self._state.get_lock(group_id):
             self._state.record_actual_reply(group_id)
             self._state.clear_follow_up(group_id)
+            if pending:
+                user_ids, reason = pending
+                self._state.add_follow_up(group_id, user_ids=user_ids, reason=reason)
 
         self._tool_ctx.clear_context()
         await self._state.save_dirty(self._kv_save)
-        logger.info("Iris Reply: actual reply sent for group %s, follow-up cleared", group_id)
+        logger.info("Iris Reply: actual reply sent for group %s, follow-up updated", group_id)
 
     @staticmethod
     def _extract_json(text: str) -> dict | None:
