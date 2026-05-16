@@ -19,8 +19,6 @@ _DEFAULTS = {
     "follow_up_patience": 3,
     "quality_threshold": 0.2,
     "provider_id": "",
-    "summary_provider_id": "",
-    "summary_min_interval": 15,
     "trigger_min_interval": 30,
     "boost_factor": 0.6,
     "boost_duration": 15,
@@ -100,14 +98,6 @@ class ConfigManager:
     @property
     def provider_id(self) -> str:
         return str(self._get("provider_id", ""))
-
-    @property
-    def summary_provider_id(self) -> str:
-        return str(self._get("summary_provider_id", ""))
-
-    @property
-    def summary_min_interval(self) -> int:
-        return max(5, min(120, int(self._get("summary_min_interval"))))
 
     @property
     def trigger_min_interval(self) -> int:

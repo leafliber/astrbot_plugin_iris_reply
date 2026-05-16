@@ -76,23 +76,10 @@
     "hint": "低于此阈值的消息不进入滑动窗口，范围 0.0-1.0"
   },
   "provider_id": {
-    "description": "触发阶段使用的 LLM 提供商 ID（留空使用默认提供商）",
+    "description": "本插件使用的 LLM 提供商 ID（留空使用默认提供商）",
     "type": "string",
     "default": "",
     "_special": "select_provider"
-  },
-  "summary_provider_id": {
-    "description": "总结阶段使用的 LLM 提供商 ID（留空使用默认提供商）",
-    "type": "string",
-    "default": "",
-    "hint": "可配置为轻量模型以节省资源，留空则复用触发阶段的提供商",
-    "_special": "select_provider"
-  },
-  "summary_min_interval": {
-    "description": "总结阶段最小间隔（秒）",
-    "type": "int",
-    "default": 15,
-    "hint": "同一群两次总结之间的最小时间间隔，范围 5-120"
   },
   "trigger_min_interval": {
     "description": "触发阶段最小间隔（秒）",

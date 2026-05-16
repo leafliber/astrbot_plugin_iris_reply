@@ -53,7 +53,6 @@ class GroupStateData:
     boost_set_at: float = 0.0
     boost_until: float = 0.0
     last_detect_time: float = 0.0
-    last_summary_time: float = 0.0
     dirty: bool = False
 
 
@@ -270,10 +269,11 @@ class StateManager:
         self._check_auto_adjust(group_id, data)
         self._mark_dirty(group_id, data)
 
-    def record_actual_reply(self, group_id: str) -> None:
+    def record_actual_reply(self, group_id: str, *, count_consecutive: bool = True) -> None:
         data = self._ensure_group(group_id)
         data.backoff_level = max(0, data.backoff_level - 1)
-        data.consecutive_replies += 1
+        if count_consecutive:
+            data.consecutive_replies += 1
 
         max_br = self._config.max_boosted_replies
         if data.consecutive_replies <= max_br:
@@ -319,15 +319,6 @@ class StateManager:
         data = self._ensure_group(group_id)
         data.last_detect_time = time.time()
 
-    def can_summarize(self, group_id: str, min_interval: float) -> bool:
-        data = self._ensure_group(group_id)
-        now = time.time()
-        return (now - data.last_summary_time) >= min_interval
-
-    def record_summary_time(self, group_id: str) -> None:
-        data = self._ensure_group(group_id)
-        data.last_summary_time = time.time()
-
     def increment_patience(self, group_id: str) -> int:
         data = self._ensure_group(group_id)
         data.follow_up.patience_count += 1
@@ -362,7 +353,6 @@ class StateManager:
         data.boost_set_at = 0.0
         data.boost_until = 0.0
         data.last_detect_time = 0.0
-        data.last_summary_time = 0.0
         data.follow_up.user_ids.clear()
         data.follow_up.user_ttls.clear()
         data.follow_up.reason = ""
@@ -466,7 +456,6 @@ class StateManager:
             "boost_set_at": data.boost_set_at,
             "boost_until": data.boost_until,
             "last_detect_time": data.last_detect_time,
-            "last_summary_time": data.last_summary_time,
         }
 
     def _deserialize_group(self, d: dict[str, Any]) -> GroupStateData:
@@ -511,7 +500,6 @@ class StateManager:
             boost_set_at=d.get("boost_set_at", 0.0),
             boost_until=d.get("boost_until", 0.0),
             last_detect_time=d.get("last_detect_time", 0.0),
-            last_summary_time=d.get("last_summary_time", 0.0),
         )
 
     def get_status_text(self, group_id: str) -> str:
