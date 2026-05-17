@@ -16,6 +16,7 @@ if _plugin_dir not in sys.path:
 from astrbot.api import logger
 from astrbot.api.event.filter import (
     EventMessageType,
+    after_message_sent,
     command_group,
     event_message_type,
     llm_tool,
@@ -473,7 +474,9 @@ class IrisReply(Star):
             "\n\n消息中可能包含 <iris:...> 标签包裹的参考上下文"
             "（如群聊记录、用户画像、记忆、人设等），"
             "这些仅供你理解对话背景，绝对不要在你的回复中复述或输出这些上下文内容。"
-            "直接以自然的方式回复用户的消息即可。"
+            "\n\n你正在主动加入一个群聊对话，用户的消息并非直接对你说的。"
+            "请根据 <iris:...> 中的上下文理解当前讨论的话题，"
+            "以自然的方式参与对话，而不是把用户的消息当作对你提出的问题来回答。"
             "\n\n你的回复必须是纯粹的对话内容，"
             "不要输出任何元评论、内心独白、舞台指示或括号内的策略说明"
             "（如「接话」、「活跃气氛」等）。"
@@ -516,6 +519,21 @@ class IrisReply(Star):
 
             await self._state.save_dirty(self._kv_save)
             logger.info("Iris Reply: passive reply boost applied for group %s", group_id)
+
+    @after_message_sent()
+    async def on_message_sent(self, event) -> None:
+        group_id = event.get_group_id()
+        if not group_id:
+            return
+        if not self._state.is_whitelisted(group_id):
+            return
+        sender_id = event.get_sender_id()
+        if not sender_id:
+            return
+        async with self._state.get_lock(group_id):
+            self._state.add_follow_up(group_id, user_ids=[sender_id])
+        await self._state.save_dirty(self._kv_save)
+        logger.debug("Iris Reply: auto follow-up sender %s in group %s after message sent", sender_id, group_id)
 
     @staticmethod
     def _extract_json(text: str) -> dict | None:
