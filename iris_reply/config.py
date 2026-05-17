@@ -17,6 +17,7 @@ _DEFAULTS = {
     "max_token": 3000,
     "follow_up_ttl": 10,
     "follow_up_patience": 3,
+    "follow_up_aggregate_window": 6,
     "quality_threshold": 0.2,
     "provider_id": "",
     "trigger_min_interval": 30,
@@ -90,6 +91,10 @@ class ConfigManager:
     @property
     def follow_up_patience(self) -> int:
         return max(1, min(10, int(self._get("follow_up_patience"))))
+
+    @property
+    def follow_up_aggregate_window(self) -> int:
+        return max(3, min(30, int(self._get("follow_up_aggregate_window"))))
 
     @property
     def quality_threshold(self) -> float:

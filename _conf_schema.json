@@ -69,6 +69,12 @@
     "default": 3,
     "hint": "连续多少次总结认为不值得关注后清除跟进记录，范围 1-10"
   },
+  "follow_up_aggregate_window": {
+    "description": "follow-up 消息聚合等待窗口（秒）",
+    "type": "int",
+    "default": 6,
+    "hint": "被关注用户发言后等待此时间再触发 LLM 评估，期间的消息会被聚合，范围 3-30"
+  },
   "quality_threshold": {
     "description": "消息质量评分阈值",
     "type": "float",

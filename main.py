@@ -66,6 +66,7 @@ class IrisReply(Star):
         self._pending_follow_up: dict[str, tuple[list[str], str]] = {}
         self._observation_cache: dict[str, str] = {}
         self._triggering: set[str] = set()
+        self._follow_pending: set[str] = set()
         self._save_task: asyncio.Task | None = None
         self._save_interval = 30
 
@@ -82,6 +83,7 @@ class IrisReply(Star):
             except asyncio.CancelledError:
                 pass
         await self._state.save_all(self._kv_save)
+        self._follow_pending.clear()
         logger.info("Iris Reply: terminated")
 
     async def _periodic_save(self) -> None:
@@ -101,7 +103,6 @@ class IrisReply(Star):
             logger.warning("Iris Reply: cleaning up stale active for group %s (timeout)", gid)
             self._iris_active.pop(gid, None)
             self._iris_context.pop(gid, None)
-            self._tool_ctx.clear_context()
         stale_passive = [gid for gid, ts in self._passive_active.items() if now - ts > _IRIS_ACTIVE_TIMEOUT]
         for gid in stale_passive:
             logger.warning("Iris Reply: cleaning up stale passive for group %s (timeout)", gid)
@@ -300,6 +301,22 @@ class IrisReply(Star):
         if not trigger_reason:
             return
 
+        if trigger_reason == "follow_up":
+            if group_id in self._follow_pending:
+                logger.debug("Iris Reply: follow-up aggregation pending for group %s", group_id)
+                return
+            self._follow_pending.add(group_id)
+            try:
+                await asyncio.sleep(self._config.follow_up_aggregate_window)
+            finally:
+                self._follow_pending.discard(group_id)
+
+            if group_id in self._iris_active:
+                return
+            follow_up_users, _ = self._state.get_follow_up_info(group_id)
+            if not follow_up_users:
+                return
+
         if not self._state.can_detect(group_id):
             logger.debug("Iris Reply: trigger rate-limited for group %s", group_id)
             return
@@ -353,7 +370,8 @@ class IrisReply(Star):
                 if follow_up_reason:
                     user_prompt += f"，原因：{follow_up_reason}"
                 user_prompt += (
-                    "。现在其中有人发言了，请认真考虑是否回复。"
+                    "。现在其中有人发言了（可能连续发了多条），"
+                    "请综合评估所有新消息后决定是否回复。"
                     "如果当前话题已经偏离了你之前关注的原因，将 drifted 设为 true。"
                     "</follow_up_reminder>"
                 )
