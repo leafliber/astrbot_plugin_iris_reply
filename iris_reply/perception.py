@@ -130,6 +130,6 @@ class ContextPackager:
         context_text = "\n".join(lines[start:])
 
         escaped_reason = quoteattr(trigger_reason)
-        header = f"<iris:context trigger_reason={escaped_reason}>\n"
-        footer = "\n</iris:context>"
+        header = f"<iris:reply-context trigger_reason={escaped_reason}>\n"
+        footer = "\n</iris:reply-context>"
         return header + context_text + footer

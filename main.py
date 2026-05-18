@@ -430,7 +430,6 @@ class IrisReply(Star):
             return
 
         self._iris_context[group_id] = {
-            "persona": prompts["persona"],
             "observation": result.observation,
             "context_text": context_text,
         }
@@ -457,10 +456,18 @@ class IrisReply(Star):
             return
 
         sections = []
-        sections.append(f"<iris:persona>\n{ctx['persona']}\n</iris:persona>")
+        sections.append(
+            "<iris:reply-hint>\n"
+            "当前消息并非直接对你说的，用户可能是在和其他人聊天。"
+            "请根据上下文判断如何自然地接话或参与讨论，"
+            "不要把用户消息当作对你的提问。"
+            "\n</iris:reply:hint>"
+        )
         observation = ctx.get("observation", "")
         if observation:
-            sections.append(f"<iris:conversation_summary>\n{observation}\n</iris:conversation_summary>")
+            sections.append(
+                f"<iris:reply-summary>\n{observation}\n</iris:reply:summary>"
+            )
         sections.append(ctx["context_text"])
 
         combined = "\n\n".join(sections)
@@ -469,23 +476,6 @@ class IrisReply(Star):
         if hasattr(text_part, "mark_as_temp"):
             text_part.mark_as_temp()
         request.extra_user_content_parts.append(text_part)
-
-        context_instruction = (
-            "\n\n消息中可能包含 <iris:...> 标签包裹的参考上下文"
-            "（如群聊记录、用户画像、记忆、人设等），"
-            "这些仅供你理解对话背景，绝对不要在你的回复中复述或输出这些上下文内容。"
-            "\n\n你正在主动加入一个群聊对话，用户的消息并非直接对你说的。"
-            "请根据 <iris:...> 中的上下文理解当前讨论的话题，"
-            "以自然的方式参与对话，而不是把用户的消息当作对你提出的问题来回答。"
-            "\n\n你的回复必须是纯粹的对话内容，"
-            "不要输出任何元评论、内心独白、舞台指示或括号内的策略说明"
-            "（如「接话」、「活跃气氛」等）。"
-            "只输出你会实际说出来的话。"
-        )
-        if request.system_prompt:
-            request.system_prompt += context_instruction
-        else:
-            request.system_prompt = context_instruction.strip()
 
         logger.info("Iris Reply: injected context for group %s", group_id)
 
