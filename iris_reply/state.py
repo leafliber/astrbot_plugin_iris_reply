@@ -31,7 +31,6 @@ class FollowUpEntry:
     user_ids: set[str] = field(default_factory=set)
     user_ttls: dict[str, float] = field(default_factory=dict)
     reason: str = ""
-    patience_count: int = 0
 
 
 @dataclass
@@ -123,10 +122,11 @@ class StateManager:
         group_id: str,
         user_ids: list[str] | None = None,
         reason: str = "",
+        ttl_minutes: float | None = None,
     ) -> None:
         data = self._ensure_group(group_id)
         now = time.time()
-        ttl = self._config.follow_up_ttl * 60
+        ttl = (ttl_minutes if ttl_minutes is not None else self._config.follow_up_ttl) * 60
         was_following = data.state == GroupState.FOLLOWING
         if user_ids:
             for uid in user_ids:
@@ -139,9 +139,6 @@ class StateManager:
         if not was_following:
             data.state = GroupState.FOLLOWING
             data.following_since = now
-            data.backoff_level = 0
-            data.auto_adjust_factor = 1.0
-            data.consecutive_replies = 0
         self._mark_dirty(group_id, data)
 
     def remove_follow_up(
@@ -271,7 +268,8 @@ class StateManager:
 
     def record_actual_reply(self, group_id: str, *, count_consecutive: bool = True) -> None:
         data = self._ensure_group(group_id)
-        data.backoff_level = max(0, data.backoff_level - 1)
+        if data.consecutive_replies == 0:
+            data.backoff_level = max(0, data.backoff_level - 1)
         if count_consecutive:
             data.consecutive_replies += 1
 
@@ -287,7 +285,8 @@ class StateManager:
         now = time.time()
         data.boost_initial = strength
         data.boost_set_at = now
-        data.boost_until = now + self._config.boost_duration * 60
+        if data.boost_until <= now:
+            data.boost_until = now + self._config.boost_duration * 60
 
         if data.auto_adjust_factor > 1.0:
             data.auto_adjust_factor = max(1.0, data.auto_adjust_factor / 1.5)
@@ -309,33 +308,23 @@ class StateManager:
                 data.auto_adjust_factor = new_factor
                 data.last_auto_adjust_time = now
 
-    def can_detect(self, group_id: str) -> bool:
+    def can_detect(self, group_id: str, *, follow_up: bool = False) -> bool:
         data = self._ensure_group(group_id)
         now = time.time()
         min_interval = float(self._config.trigger_min_interval)
+        if follow_up:
+            min_interval *= 0.5
         return (now - data.last_detect_time) >= min_interval
 
     def record_detect_time(self, group_id: str) -> None:
         data = self._ensure_group(group_id)
         data.last_detect_time = time.time()
 
-    def increment_patience(self, group_id: str) -> int:
-        data = self._ensure_group(group_id)
-        data.follow_up.patience_count += 1
-        self._mark_dirty(group_id, data)
-        return data.follow_up.patience_count
-
-    def reset_patience(self, group_id: str) -> None:
-        data = self._ensure_group(group_id)
-        data.follow_up.patience_count = 0
-        self._mark_dirty(group_id, data)
-
     def clear_follow_up(self, group_id: str) -> None:
         data = self._ensure_group(group_id)
         data.follow_up.user_ids.clear()
         data.follow_up.user_ttls.clear()
         data.follow_up.reason = ""
-        data.follow_up.patience_count = 0
         data.state = GroupState.IDLE
         self._mark_dirty(group_id, data)
 
@@ -356,7 +345,6 @@ class StateManager:
         data.follow_up.user_ids.clear()
         data.follow_up.user_ttls.clear()
         data.follow_up.reason = ""
-        data.follow_up.patience_count = 0
         data.following_since = 0.0
         data.state = GroupState.IDLE
         self._mark_dirty(group_id, data)
@@ -449,7 +437,6 @@ class StateManager:
                 "user_ids": list(data.follow_up.user_ids),
                 "user_ttls": data.follow_up.user_ttls,
                 "reason": data.follow_up.reason,
-                "patience_count": data.follow_up.patience_count,
             },
             "willingness": data.willingness,
             "boost_initial": data.boost_initial,
@@ -463,7 +450,6 @@ class StateManager:
             user_ids=set(d.get("follow_up", {}).get("user_ids", [])),
             user_ttls=d.get("follow_up", {}).get("user_ttls", {}),
             reason=d.get("follow_up", {}).get("reason", ""),
-            patience_count=d.get("follow_up", {}).get("patience_count", 0),
         )
         willingness = d.get("willingness", DEFAULT_LEVEL)
         if willingness not in VALID_LEVELS:
@@ -530,5 +516,4 @@ class StateManager:
             lines.append(f"  跟进用户: {', '.join(sorted(data.follow_up.user_ids))}")
             if data.follow_up.reason:
                 lines.append(f"  跟进原因: {data.follow_up.reason}")
-            lines.append(f"  耐心计数: {data.follow_up.patience_count}/{self._config.follow_up_patience}")
         return "\n".join(lines)

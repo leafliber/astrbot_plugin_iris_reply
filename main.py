@@ -63,6 +63,7 @@ class IrisReply(Star):
         self._iris_context: dict[str, dict[str, str]] = {}
         self._iris_active: dict[str, float] = {}
         self._passive_active: dict[str, float] = {}
+        self._proactive_reason: dict[str, str] = {}
         self._pending_follow_up: dict[str, tuple[list[str], str]] = {}
         self._observation_cache: dict[str, str] = {}
         self._triggering: set[str] = set()
@@ -107,6 +108,12 @@ class IrisReply(Star):
         for gid in stale_passive:
             logger.warning("Iris Reply: cleaning up stale passive for group %s (timeout)", gid)
             self._passive_active.pop(gid, None)
+        stale_proactive = [gid for gid in self._proactive_reason]
+        for gid in stale_proactive:
+            self._proactive_reason.pop(gid, None)
+        stale_obs = [gid for gid in self._observation_cache if gid not in self._iris_active and gid not in self._state.get_whitelist()]
+        for gid in stale_obs:
+            self._observation_cache.pop(gid, None)
 
     async def _kv_save(self, key: str, value: Any) -> None:
         await self.put_kv_data(key, value)
@@ -301,7 +308,9 @@ class IrisReply(Star):
         if not trigger_reason:
             return
 
-        if trigger_reason == "follow_up":
+        is_follow_up = trigger_reason == "follow_up"
+
+        if is_follow_up:
             if group_id in self._follow_pending:
                 logger.debug("Iris Reply: follow-up aggregation pending for group %s", group_id)
                 return
@@ -317,7 +326,7 @@ class IrisReply(Star):
             if not follow_up_users:
                 return
 
-        if not self._state.can_detect(group_id):
+        if not self._state.can_detect(group_id, follow_up=is_follow_up):
             logger.debug("Iris Reply: trigger rate-limited for group %s", group_id)
             return
 
@@ -431,6 +440,7 @@ class IrisReply(Star):
         self._iris_context[group_id] = {}
         self._iris_active[group_id] = time.time()
         self._passive_active.pop(group_id, None)
+        self._proactive_reason[group_id] = result.observation
         event.is_at_or_wake_command = True
         event.is_wake = True
         if provider_id:
@@ -498,6 +508,13 @@ class IrisReply(Star):
             return
         sender_id = event.get_sender_id()
         if not sender_id:
+            return
+        if group_id in self._proactive_reason:
+            reason = self._proactive_reason.pop(group_id, "")
+            async with self._state.get_lock(group_id):
+                self._state.add_follow_up(group_id, user_ids=[sender_id], ttl_minutes=3, reason=reason)
+            await self._state.save_dirty(self._kv_save)
+            logger.debug("Iris Reply: short-TTL follow-up sender %s in group %s after proactive reply", sender_id, group_id)
             return
         async with self._state.get_lock(group_id):
             self._state.add_follow_up(group_id, user_ids=[sender_id])
