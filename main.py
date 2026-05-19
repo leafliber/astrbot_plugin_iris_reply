@@ -670,9 +670,82 @@ class IrisReply(Star):
             self._stats.clear_logs()
             return jsonify({"ok": True})
 
+        async def _whitelist_list():
+            groups = []
+            for gid in self._state.get_whitelist():
+                data = self._state.get_state(gid)
+                effective_n, effective_t = self._state.get_effective_thresholds(gid)
+                groups.append({
+                    "group_id": gid,
+                    "state": data.state.value,
+                    "willingness": data.willingness,
+                    "msg_count": data.msg_count,
+                    "effective_n": effective_n,
+                    "effective_t": effective_t,
+                    "backoff_level": data.backoff_level,
+                    "consecutive_replies": data.consecutive_replies,
+                })
+            return jsonify(groups)
+
+        async def _whitelist_enable():
+            from quart import request as qrequest
+            body = await qrequest.get_json(force=True, silent=True) or {}
+            group_id = body.get("group_id", "")
+            if not group_id:
+                return jsonify({"error": "group_id required"}), 400
+            self._state.add_to_whitelist(str(group_id))
+            await self._state.save_dirty(self._kv_save)
+            return jsonify({"ok": True, "group_id": group_id})
+
+        async def _whitelist_disable():
+            from quart import request as qrequest
+            body = await qrequest.get_json(force=True, silent=True) or {}
+            group_id = body.get("group_id", "")
+            if not group_id:
+                return jsonify({"error": "group_id required"}), 400
+            self._state.remove_from_whitelist(str(group_id))
+            self._sliding_window.remove_group(str(group_id))
+            self._state.remove_group_lock(str(group_id))
+            await self._state.save_dirty(self._kv_save)
+            return jsonify({"ok": True, "group_id": group_id})
+
+        async def _group_set_willingness():
+            from quart import request as qrequest
+            body = await qrequest.get_json(force=True, silent=True) or {}
+            group_id = body.get("group_id", "")
+            level = body.get("willingness", "")
+            if not group_id or not level:
+                return jsonify({"error": "group_id and willingness required"}), 400
+            from iris_reply.prompts import resolve_level
+            resolved = resolve_level(level)
+            if not resolved:
+                return jsonify({"error": "invalid willingness level"}), 400
+            self._state.set_willingness(str(group_id), resolved)
+            await self._state.save_dirty(self._kv_save)
+            return jsonify({"ok": True, "group_id": group_id, "willingness": resolved})
+
+        async def _group_reset():
+            from quart import request as qrequest
+            body = await qrequest.get_json(force=True, silent=True) or {}
+            group_id = body.get("group_id", "")
+            if not group_id:
+                return jsonify({"error": "group_id required"}), 400
+            self._state.reset_group(str(group_id))
+            await self._state.save_dirty(self._kv_save)
+            return jsonify({"ok": True, "group_id": group_id})
+
         prefix = f"/{PLUGIN_NAME}/stats"
         self.context.register_web_api(f"{prefix}/status", _stats_status, ["GET"], "Stats status")
         self.context.register_web_api(f"{prefix}/groups", _stats_groups, ["GET"], "Stats groups")
         self.context.register_web_api(f"{prefix}/logs", _stats_logs, ["GET"], "Stats logs")
         self.context.register_web_api(f"{prefix}/group/<group_id>", _stats_group_detail, ["GET"], "Stats group detail")
         self.context.register_web_api(f"{prefix}/clear", _stats_clear, ["POST"], "Stats clear")
+
+        wl_prefix = f"/{PLUGIN_NAME}/whitelist"
+        self.context.register_web_api(f"{wl_prefix}/list", _whitelist_list, ["GET"], "Whitelist list")
+        self.context.register_web_api(f"{wl_prefix}/enable", _whitelist_enable, ["POST"], "Whitelist enable")
+        self.context.register_web_api(f"{wl_prefix}/disable", _whitelist_disable, ["POST"], "Whitelist disable")
+
+        grp_prefix = f"/{PLUGIN_NAME}/group"
+        self.context.register_web_api(f"{grp_prefix}/set_willingness", _group_set_willingness, ["POST"], "Group set willingness")
+        self.context.register_web_api(f"{grp_prefix}/reset", _group_reset, ["POST"], "Group reset")

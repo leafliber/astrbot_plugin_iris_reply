@@ -1,15 +1,20 @@
 const bridge = window.AstrBotPluginPage;
 
-const GROUP_PAGE_SIZE = 20;
 const LOG_PAGE_SIZE = 20;
 
 let logPage = 0;
 let selectedGroup = "";
+let currentTab = "manage";
 
 await bridge.ready();
 
-async function apiGet(endpoint, params) {
-  return bridge.apiGet(endpoint, params);
+function escapeHtml(str) {
+  if (!str) return "";
+  return str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }
 
 function formatTime(ts) {
@@ -51,26 +56,38 @@ function resultBadge(log) {
   return `<span class="badge badge-skip">跳过</span>`;
 }
 
-function escapeHtml(str) {
-  if (!str) return "";
-  return str
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+document.querySelectorAll(".tab").forEach((tab) => {
+  tab.addEventListener("click", () => {
+    document.querySelectorAll(".tab").forEach((t) => t.classList.remove("active"));
+    document.querySelectorAll(".tab-content").forEach((c) => c.classList.remove("active"));
+    tab.classList.add("active");
+    const name = tab.getAttribute("data-tab");
+    document.getElementById(`tab-${name}`).classList.add("active");
+    currentTab = name;
+    if (name === "manage") renderManage();
+    else renderStats();
+  });
+});
+
+async function loadWhitelist() {
+  try {
+    return await bridge.apiGet("whitelist/list");
+  } catch {
+    return [];
+  }
 }
 
-async function loadStatus() {
+async function loadStatsStatus() {
   try {
-    return await apiGet("stats/status");
+    return await bridge.apiGet("stats/status");
   } catch {
     return { enabled: false };
   }
 }
 
-async function loadGroups() {
+async function loadStatsGroups() {
   try {
-    return await apiGet("stats/groups");
+    return await bridge.apiGet("stats/groups");
   } catch {
     return [];
   }
@@ -80,18 +97,118 @@ async function loadLogs(groupId, page) {
   try {
     const params = { limit: LOG_PAGE_SIZE, offset: page * LOG_PAGE_SIZE };
     if (groupId) params.group_id = groupId;
-    return await apiGet("stats/logs", params);
+    return await bridge.apiGet("stats/logs", params);
   } catch {
     return [];
   }
 }
 
-async function render() {
-  const content = document.getElementById("content");
-  const status = await loadStatus();
+async function renderManage() {
+  const container = document.getElementById("tab-manage");
+  const groups = await loadWhitelist();
+
+  let rows = "";
+  for (const g of groups) {
+    rows += `<tr>
+      <td>${escapeHtml(g.group_id)}</td>
+      <td>
+        <label class="toggle-switch">
+          <input type="checkbox" checked data-group="${escapeHtml(g.group_id)}" class="group-toggle" />
+          <span class="toggle-slider"></span>
+        </label>
+        <span class="badge badge-on">已启用</span>
+      </td>
+      <td>${stateBadge(g.state)}</td>
+      <td>
+        <select class="willingness-select" data-group="${escapeHtml(g.group_id)}">
+          <option value="low" ${g.willingness === "low" ? "selected" : ""}>低</option>
+          <option value="medium" ${g.willingness === "medium" ? "selected" : ""}>中</option>
+          <option value="high" ${g.willingness === "high" ? "selected" : ""}>高</option>
+        </select>
+      </td>
+      <td>${g.msg_count}</td>
+      <td>${g.effective_n}/${g.effective_t}m</td>
+      <td>${g.backoff_level}</td>
+      <td>${g.consecutive_replies}</td>
+      <td>
+        <button class="action-btn" data-action="reset" data-group="${escapeHtml(g.group_id)}">重置</button>
+        <button class="action-btn danger" data-action="disable" data-group="${escapeHtml(g.group_id)}">禁用</button>
+      </td>
+    </tr>`;
+  }
+
+  const emptyHtml = !groups.length ? '<div class="empty">暂无已启用的群聊</div>' : "";
+
+  container.innerHTML = `
+    <div class="add-group-row">
+      <input type="text" id="newGroupId" placeholder="输入群ID以添加到白名单" />
+      <button class="btn-success" id="addGroupBtn">启用群聊</button>
+    </div>
+    ${emptyHtml}
+    ${groups.length ? `<table>
+      <thead>
+        <tr>
+          <th>群ID</th>
+          <th>状态</th>
+          <th>状态机</th>
+          <th>意愿</th>
+          <th>消息</th>
+          <th>阈值 N/T</th>
+          <th>退避</th>
+          <th>连续</th>
+          <th>操作</th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>` : ""}
+  `;
+
+  document.getElementById("addGroupBtn").addEventListener("click", async () => {
+    const input = document.getElementById("newGroupId");
+    const gid = input.value.trim();
+    if (!gid) return;
+    await bridge.apiPost("whitelist/enable", { group_id: gid });
+    input.value = "";
+    renderManage();
+  });
+
+  document.getElementById("newGroupId").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") document.getElementById("addGroupBtn").click();
+  });
+
+  container.querySelectorAll(".willingness-select").forEach((sel) => {
+    sel.addEventListener("change", async () => {
+      const gid = sel.getAttribute("data-group");
+      await bridge.apiPost("group/set_willingness", {
+        group_id: gid,
+        willingness: sel.value,
+      });
+    });
+  });
+
+  container.querySelectorAll(".action-btn").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const action = btn.getAttribute("data-action");
+      const gid = btn.getAttribute("data-group");
+      if (action === "disable") {
+        if (!confirm(`确定要禁用群 ${gid} 的主动回复吗？`)) return;
+        await bridge.apiPost("whitelist/disable", { group_id: gid });
+        renderManage();
+      } else if (action === "reset") {
+        if (!confirm(`确定要重置群 ${gid} 的状态吗？`)) return;
+        await bridge.apiPost("group/reset", { group_id: gid });
+        renderManage();
+      }
+    });
+  });
+}
+
+async function renderStats() {
+  const container = document.getElementById("tab-stats");
+  const status = await loadStatsStatus();
 
   if (!status.enabled) {
-    content.innerHTML = `
+    container.innerHTML = `
       <div class="stats-disabled">
         <h2>统计监控未启用</h2>
         <p>请在插件配置中开启「启用统计监控」选项后刷新此页面</p>
@@ -99,18 +216,18 @@ async function render() {
     return;
   }
 
-  const groups = await loadGroups();
+  const groups = await loadStatsGroups();
 
   let groupOptions = '<option value="">全部群聊</option>';
   for (const g of groups) {
     groupOptions += `<option value="${escapeHtml(g.group_id)}">${escapeHtml(g.group_id)}</option>`;
   }
 
-  content.innerHTML = `
+  container.innerHTML = `
     <div class="toolbar">
       <select id="groupFilter">${groupOptions}</select>
       <button id="refreshBtn">刷新</button>
-      <button id="clearBtn">清除记录</button>
+      <button id="clearBtn" class="btn-danger">清除记录</button>
     </div>
 
     <h2>群聊概览</h2>
@@ -125,24 +242,25 @@ async function render() {
   document.getElementById("groupFilter").addEventListener("change", (e) => {
     selectedGroup = e.target.value;
     logPage = 0;
-    renderGroups(groups);
-    renderLogs();
+    renderStatsGroups(groups);
+    renderStatsLogs();
   });
   document.getElementById("refreshBtn").addEventListener("click", () => {
-    render();
+    renderStats();
   });
   document.getElementById("clearBtn").addEventListener("click", async () => {
     if (!confirm("确定要清除所有统计数据吗？")) return;
     await bridge.apiPost("stats/clear");
-    render();
+    renderStats();
   });
 
-  renderGroups(groups);
-  renderLogs();
+  renderStatsGroups(groups);
+  renderStatsLogs();
 }
 
-function renderGroups(groups) {
+function renderStatsGroups(groups) {
   const container = document.getElementById("groupTable");
+  if (!container) return;
   if (!groups.length) {
     container.innerHTML = '<div class="empty">暂无群聊数据</div>';
     return;
@@ -190,16 +308,17 @@ function renderGroups(groups) {
   container.innerHTML = html;
 }
 
-async function renderLogs() {
+async function renderStatsLogs() {
   const container = document.getElementById("logList");
   const pagination = document.getElementById("logPagination");
+  if (!container) return;
   container.innerHTML = '<div class="loading">加载中...</div>';
 
   const logs = await loadLogs(selectedGroup, logPage);
 
   if (!logs.length) {
     container.innerHTML = '<div class="empty">暂无调用日志</div>';
-    pagination.innerHTML = "";
+    if (pagination) pagination.innerHTML = "";
     return;
   }
 
@@ -242,18 +361,20 @@ async function renderLogs() {
     });
   });
 
-  pagination.innerHTML = `
-    <button id="prevPage" ${logPage === 0 ? "disabled" : ""}>上一页</button>
-    <span>第 ${logPage + 1} 页</span>
-    <button id="nextPage" ${logs.length < LOG_PAGE_SIZE ? "disabled" : ""}>下一页</button>
-  `;
+  if (pagination) {
+    pagination.innerHTML = `
+      <button id="prevPage" ${logPage === 0 ? "disabled" : ""}>上一页</button>
+      <span>第 ${logPage + 1} 页</span>
+      <button id="nextPage" ${logs.length < LOG_PAGE_SIZE ? "disabled" : ""}>下一页</button>
+    `;
 
-  document.getElementById("prevPage").addEventListener("click", () => {
-    if (logPage > 0) { logPage--; renderLogs(); }
-  });
-  document.getElementById("nextPage").addEventListener("click", () => {
-    logPage++; renderLogs();
-  });
+    document.getElementById("prevPage").addEventListener("click", () => {
+      if (logPage > 0) { logPage--; renderStatsLogs(); }
+    });
+    document.getElementById("nextPage").addEventListener("click", () => {
+      logPage++; renderStatsLogs();
+    });
+  }
 }
 
-render();
+renderManage();
