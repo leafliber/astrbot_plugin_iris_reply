@@ -4,6 +4,12 @@
     "type": "bool",
     "default": true
   },
+  "stats_enabled": {
+    "description": "启用统计监控",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后将在插件 Page 中展示各群聊触发状态和 LLM 调用详情，默认关闭"
+  },
   "mute_period": {
     "description": "静音时段",
     "type": "object",

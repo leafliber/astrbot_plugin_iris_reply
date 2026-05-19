@@ -5,6 +5,7 @@ from astrbot.api import AstrBotConfig
 
 _DEFAULTS = {
     "enabled": True,
+    "stats_enabled": False,
     "mute_period": {
         "start_hour": 1,
         "start_minute": 0,
@@ -39,6 +40,10 @@ class ConfigManager:
     @property
     def enabled(self) -> bool:
         return bool(self._get("enabled"))
+
+    @property
+    def stats_enabled(self) -> bool:
+        return bool(self._get("stats_enabled"))
 
     @property
     def mute_period(self) -> tuple[int, int, int, int]:

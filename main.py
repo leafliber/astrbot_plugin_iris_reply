@@ -33,8 +33,11 @@ from iris_reply.config import ConfigManager
 from iris_reply.perception import ContextPackager, Gatekeeper, SlidingWindow, WindowMessage
 from iris_reply.prompts import WILLINGNESS_PROMPTS
 from iris_reply.state import StateManager
+from iris_reply.stats import StatsCollector
 from iris_reply.tools import ToolContext
 from iris_reply.trigger import TriggerEngine
+
+PLUGIN_NAME = "astrbot_plugin_iris_reply"
 
 _IRIS_ACTIVE_TIMEOUT = 120
 
@@ -60,6 +63,7 @@ class IrisReply(Star):
         self._trigger_engine = TriggerEngine(self._config, self._state)
         self._tool_ctx = ToolContext()
         self._admin = AdminCommands(self._state)
+        self._stats = StatsCollector()
         self._iris_context: dict[str, dict[str, str]] = {}
         self._iris_active: dict[str, float] = {}
         self._passive_active: dict[str, float] = {}
@@ -74,6 +78,8 @@ class IrisReply(Star):
     async def initialize(self) -> None:
         await self._state.load_all(self._kv_load)
         self._save_task = asyncio.create_task(self._periodic_save())
+        self._stats.enabled = self._config.stats_enabled
+        self._register_stats_api()
         logger.info("Iris Reply: initialized")
 
     async def terminate(self) -> None:
@@ -94,6 +100,7 @@ class IrisReply(Star):
                 await self._state.save_dirty(self._kv_save)
                 self._sliding_window.cleanup(self._state.get_whitelist())
                 self._cleanup_stale_active()
+                self._sync_stats_group_state()
             except Exception as e:
                 logger.warning("Iris Reply: periodic save error: %s", e)
 
@@ -387,6 +394,10 @@ class IrisReply(Star):
 
         user_prompt += "\n\n" + context_text
 
+        self._stats.record_trigger_start(
+            group_id, trigger_reason, prompts["trigger_system"], user_prompt,
+        )
+
         try:
             response = await self.context.llm_generate(
                 chat_provider_id=provider_id,
@@ -395,6 +406,7 @@ class IrisReply(Star):
             )
         except Exception as e:
             logger.error("Iris Reply: trigger LLM call failed for group %s: %s", group_id, e)
+            self._stats.record_trigger_error(group_id)
             return
 
         completion = response.completion_text or ""
@@ -407,6 +419,16 @@ class IrisReply(Star):
 
         if result.observation:
             self._observation_cache[group_id] = result.observation
+
+        self._stats.record_trigger_result(
+            group_id=group_id,
+            response_text=completion,
+            should_reply=result.should_reply,
+            observation=result.observation,
+            follow_up_users=result.follow_up_users,
+            interest_reason=result.interest_reason,
+            topic_drifted=result.topic_drifted,
+        )
 
         if result.topic_drifted:
             async with self._state.get_lock(group_id):
@@ -496,6 +518,7 @@ class IrisReply(Star):
             async with self._state.get_lock(group_id):
                 self._state.record_actual_reply(group_id, count_consecutive=False)
 
+            self._stats.record_passive_reply(group_id)
             await self._state.save_dirty(self._kv_save)
             logger.info("Iris Reply: passive reply boost applied for group %s", group_id)
 
@@ -599,3 +622,57 @@ class IrisReply(Star):
             interest_reason=interest_reason,
             topic_drifted=topic_drifted,
         )
+
+    def _sync_stats_group_state(self) -> None:
+        if not self._stats.enabled:
+            return
+        for gid in self._state.get_whitelist():
+            data = self._state.get_state(gid)
+            effective_n, effective_t = self._state.get_effective_thresholds(gid)
+            self._stats.update_group_state(
+                group_id=gid,
+                state=data.state.value,
+                willingness=data.willingness,
+                msg_count=data.msg_count,
+                effective_n=effective_n,
+                effective_t=effective_t,
+                backoff_level=data.backoff_level,
+                consecutive_replies=data.consecutive_replies,
+            )
+
+    def _register_stats_api(self) -> None:
+        from quart import jsonify
+
+        async def _stats_status():
+            return jsonify({"enabled": self._stats.enabled})
+
+        async def _stats_groups():
+            return jsonify(self._stats.get_group_summaries())
+
+        async def _stats_logs():
+            from quart import request as qrequest
+            group_id = qrequest.args.get("group_id", "")
+            limit = int(qrequest.args.get("limit", "50"))
+            offset = int(qrequest.args.get("offset", "0"))
+            return jsonify(self._stats.get_llm_logs(
+                group_id=group_id or None,
+                limit=limit,
+                offset=offset,
+            ))
+
+        async def _stats_group_detail(group_id: str):
+            detail = self._stats.get_group_detail(group_id)
+            if detail is None:
+                return jsonify({"error": "not found"}), 404
+            return jsonify(detail)
+
+        async def _stats_clear():
+            self._stats.clear_logs()
+            return jsonify({"ok": True})
+
+        prefix = f"/{PLUGIN_NAME}/stats"
+        self.context.register_web_api(f"{prefix}/status", _stats_status, ["GET"], "Stats status")
+        self.context.register_web_api(f"{prefix}/groups", _stats_groups, ["GET"], "Stats groups")
+        self.context.register_web_api(f"{prefix}/logs", _stats_logs, ["GET"], "Stats logs")
+        self.context.register_web_api(f"{prefix}/group/<group_id>", _stats_group_detail, ["GET"], "Stats group detail")
+        self.context.register_web_api(f"{prefix}/clear", _stats_clear, ["POST"], "Stats clear")
