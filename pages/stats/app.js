@@ -109,6 +109,14 @@ async function renderManage() {
 
   let rows = "";
   for (const g of groups) {
+    const followUsers = (g.follow_up_users && g.follow_up_users.length)
+      ? g.follow_up_users.map(u => `<span class="badge badge-following">${escapeHtml(u)}</span>`).join(" ")
+      : '<span class="muted">-</span>';
+    const followKeywords = (g.follow_up_keywords && g.follow_up_keywords.length)
+      ? g.follow_up_keywords.map(k => `<span class="badge badge-drift">${escapeHtml(k)}</span>`).join(" ")
+      : '<span class="muted">-</span>';
+    const followReason = g.follow_up_reason ? escapeHtml(g.follow_up_reason) : '<span class="muted">-</span>';
+
     rows += `<tr>
       <td>${escapeHtml(g.group_id)}</td>
       <td>
@@ -130,6 +138,9 @@ async function renderManage() {
       <td>${g.effective_n}/${g.effective_t}m</td>
       <td>${g.backoff_level}</td>
       <td>${g.consecutive_replies}</td>
+      <td>${followUsers}</td>
+      <td>${followKeywords}</td>
+      <td>${followReason}</td>
       <td>
         <button class="action-btn" data-action="reset" data-group="${escapeHtml(g.group_id)}">重置</button>
         <button class="action-btn danger" data-action="disable" data-group="${escapeHtml(g.group_id)}">禁用</button>
@@ -156,6 +167,9 @@ async function renderManage() {
           <th>阈值 N/T</th>
           <th>退避</th>
           <th>连续</th>
+          <th>跟进用户</th>
+          <th>跟进关键词</th>
+          <th>跟进原因</th>
           <th>操作</th>
         </tr>
       </thead>
@@ -340,6 +354,7 @@ async function renderStatsLogs() {
           <label>观察摘要</label>
           <pre>${escapeHtml(log.observation) || "-"}</pre>
           ${log.follow_up_users && log.follow_up_users.length ? `<label>关注用户</label><pre>${escapeHtml(log.follow_up_users.join(", "))}</pre>` : ""}
+          ${log.follow_up_keywords && log.follow_up_keywords.length ? `<label>关注关键词</label><pre>${escapeHtml(log.follow_up_keywords.join(", "))}</pre>` : ""}
           ${log.interest_reason ? `<label>关注原因</label><pre>${escapeHtml(log.interest_reason)}</pre>` : ""}
           <label>LLM 原始响应</label>
           <pre>${escapeHtml(log.response_text)}</pre>

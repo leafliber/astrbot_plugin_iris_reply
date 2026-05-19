@@ -30,6 +30,8 @@ class GroupState(Enum):
 class FollowUpEntry:
     user_ids: set[str] = field(default_factory=set)
     user_ttls: dict[str, float] = field(default_factory=dict)
+    keywords: set[str] = field(default_factory=set)
+    keyword_ttls: dict[str, float] = field(default_factory=dict)
     reason: str = ""
 
 
@@ -59,6 +61,7 @@ class StateManager:
     N_MAX = 120
     T_MAX = 300
     MAX_FOLLOW_UP_USERS = 20
+    MAX_FOLLOW_UP_KEYWORDS = 10
     BACKOFF_DECAY_INTERVAL = 300.0
     AUTO_ADJUST_DECAY_INTERVAL = 600.0
 
@@ -95,7 +98,7 @@ class StateManager:
             self._mark_dirty(group_id, data)
         if data.state == GroupState.FOLLOWING:
             self._cleanup_expired_follow(group_id, data, now)
-            if not data.follow_up.user_ids:
+            if not data.follow_up.user_ids and not data.follow_up.keywords:
                 data.state = GroupState.IDLE
                 self._mark_dirty(group_id, data)
         return data
@@ -121,6 +124,7 @@ class StateManager:
         self,
         group_id: str,
         user_ids: list[str] | None = None,
+        keywords: list[str] | None = None,
         reason: str = "",
         ttl_minutes: float | None = None,
     ) -> None:
@@ -134,6 +138,12 @@ class StateManager:
                     break
                 data.follow_up.user_ids.add(uid)
                 data.follow_up.user_ttls[uid] = now + ttl
+        if keywords:
+            for kw in keywords:
+                if len(data.follow_up.keywords) >= self.MAX_FOLLOW_UP_KEYWORDS:
+                    break
+                data.follow_up.keywords.add(kw)
+                data.follow_up.keyword_ttls[kw] = now + ttl
         if reason:
             data.follow_up.reason = reason
         if not was_following:
@@ -145,13 +155,18 @@ class StateManager:
         self,
         group_id: str,
         user_ids: list[str] | None = None,
+        keywords: list[str] | None = None,
     ) -> None:
         data = self._ensure_group(group_id)
         if user_ids:
             for uid in user_ids:
                 data.follow_up.user_ids.discard(uid)
                 data.follow_up.user_ttls.pop(uid, None)
-        if not data.follow_up.user_ids:
+        if keywords:
+            for kw in keywords:
+                data.follow_up.keywords.discard(kw)
+                data.follow_up.keyword_ttls.pop(kw, None)
+        if not data.follow_up.user_ids and not data.follow_up.keywords:
             data.state = GroupState.IDLE
         self._mark_dirty(group_id, data)
 
@@ -160,7 +175,11 @@ class StateManager:
         for uid in expired_users:
             data.follow_up.user_ids.discard(uid)
             data.follow_up.user_ttls.pop(uid, None)
-        if expired_users:
+        expired_keywords = [kw for kw, ttl in data.follow_up.keyword_ttls.items() if now >= ttl]
+        for kw in expired_keywords:
+            data.follow_up.keywords.discard(kw)
+            data.follow_up.keyword_ttls.pop(kw, None)
+        if expired_users or expired_keywords:
             self._mark_dirty(group_id, data)
 
     def match_follow_up(self, group_id: str, sender_id: str) -> bool:
@@ -169,9 +188,20 @@ class StateManager:
             return False
         return sender_id in data.follow_up.user_ids
 
-    def get_follow_up_info(self, group_id: str) -> tuple[set[str], str]:
+    def match_keyword(self, group_id: str, text: str) -> list[str]:
         data = self.get_state(group_id)
-        return data.follow_up.user_ids, data.follow_up.reason
+        if data.state == GroupState.COOLDOWN:
+            return []
+        matched = []
+        text_lower = text.lower()
+        for kw in data.follow_up.keywords:
+            if kw.lower() in text_lower:
+                matched.append(kw)
+        return matched
+
+    def get_follow_up_info(self, group_id: str) -> tuple[set[str], set[str], str]:
+        data = self.get_state(group_id)
+        return data.follow_up.user_ids, data.follow_up.keywords, data.follow_up.reason
 
     def increment_msg_count(self, group_id: str) -> int:
         data = self._ensure_group(group_id)
@@ -324,6 +354,8 @@ class StateManager:
         data = self._ensure_group(group_id)
         data.follow_up.user_ids.clear()
         data.follow_up.user_ttls.clear()
+        data.follow_up.keywords.clear()
+        data.follow_up.keyword_ttls.clear()
         data.follow_up.reason = ""
         data.state = GroupState.IDLE
         self._mark_dirty(group_id, data)
@@ -344,6 +376,8 @@ class StateManager:
         data.last_detect_time = 0.0
         data.follow_up.user_ids.clear()
         data.follow_up.user_ttls.clear()
+        data.follow_up.keywords.clear()
+        data.follow_up.keyword_ttls.clear()
         data.follow_up.reason = ""
         data.following_since = 0.0
         data.state = GroupState.IDLE
@@ -436,6 +470,8 @@ class StateManager:
             "follow_up": {
                 "user_ids": list(data.follow_up.user_ids),
                 "user_ttls": data.follow_up.user_ttls,
+                "keywords": list(data.follow_up.keywords),
+                "keyword_ttls": data.follow_up.keyword_ttls,
                 "reason": data.follow_up.reason,
             },
             "willingness": data.willingness,
@@ -449,6 +485,8 @@ class StateManager:
         follow_up = FollowUpEntry(
             user_ids=set(d.get("follow_up", {}).get("user_ids", [])),
             user_ttls=d.get("follow_up", {}).get("user_ttls", {}),
+            keywords=set(d.get("follow_up", {}).get("keywords", [])),
+            keyword_ttls=d.get("follow_up", {}).get("keyword_ttls", {}),
             reason=d.get("follow_up", {}).get("reason", ""),
         )
         willingness = d.get("willingness", DEFAULT_LEVEL)
@@ -514,6 +552,8 @@ class StateManager:
             lines.append(f"  Boost 剩余: {remaining / 60:.1f} 分钟")
         if data.follow_up.user_ids:
             lines.append(f"  跟进用户: {', '.join(sorted(data.follow_up.user_ids))}")
-            if data.follow_up.reason:
-                lines.append(f"  跟进原因: {data.follow_up.reason}")
+        if data.follow_up.keywords:
+            lines.append(f"  跟进关键词: {', '.join(sorted(data.follow_up.keywords))}")
+        if data.follow_up.reason:
+            lines.append(f"  跟进原因: {data.follow_up.reason}")
         return "\n".join(lines)

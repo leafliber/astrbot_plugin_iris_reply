@@ -47,6 +47,7 @@ class TriggerResult:
     should_reply: bool = False
     observation: str = ""
     follow_up_users: list[str] = field(default_factory=list)
+    follow_up_keywords: list[str] = field(default_factory=list)
     interest_reason: str = ""
     topic_drifted: bool = False
 
@@ -68,7 +69,7 @@ class IrisReply(Star):
         self._iris_active: dict[str, float] = {}
         self._passive_active: dict[str, float] = {}
         self._proactive_reason: dict[str, str] = {}
-        self._pending_follow_up: dict[str, tuple[list[str], str]] = {}
+        self._pending_follow_up: dict[str, tuple[list[str], list[str], str]] = {}
         self._observation_cache: dict[str, str] = {}
         self._triggering: set[str] = set()
         self._follow_pending: set[str] = set()
@@ -315,7 +316,7 @@ class IrisReply(Star):
         if not trigger_reason:
             return
 
-        is_follow_up = trigger_reason == "follow_up"
+        is_follow_up = trigger_reason in ("follow_up", "keyword_follow_up")
 
         if is_follow_up:
             if group_id in self._follow_pending:
@@ -329,8 +330,8 @@ class IrisReply(Star):
 
             if group_id in self._iris_active:
                 return
-            follow_up_users, _ = self._state.get_follow_up_info(group_id)
-            if not follow_up_users:
+            follow_up_users, follow_up_keywords, _ = self._state.get_follow_up_info(group_id)
+            if not follow_up_users and not follow_up_keywords:
                 return
 
         if not self._state.can_detect(group_id, follow_up=is_follow_up):
@@ -376,18 +377,31 @@ class IrisReply(Star):
                 "</recent_observation>"
             )
 
-        if trigger_reason == "follow_up":
-            follow_up_users, follow_up_reason = self._state.get_follow_up_info(group_id)
+        if trigger_reason in ("follow_up", "keyword_follow_up"):
+            follow_up_users, follow_up_keywords, follow_up_reason = self._state.get_follow_up_info(group_id)
+            reminder_parts = []
             if follow_up_users:
+                reminder_parts.append(f"你之前表示对这些用户感兴趣：{', '.join(follow_up_users)}")
+            if follow_up_keywords:
+                reminder_parts.append(f"你之前表示对这些关键词感兴趣：{', '.join(follow_up_keywords)}")
+            if reminder_parts:
                 user_prompt += (
                     f"\n\n<follow_up_reminder>"
-                    f"你之前表示对这些用户感兴趣：{', '.join(follow_up_users)}"
+                    f"{'；'.join(reminder_parts)}"
                 )
                 if follow_up_reason:
                     user_prompt += f"，原因：{follow_up_reason}"
+                if trigger_reason == "follow_up":
+                    user_prompt += (
+                        "。现在其中有人发言了（可能连续发了多条），"
+                        "请综合评估所有新消息后决定是否回复。"
+                    )
+                else:
+                    user_prompt += (
+                        "。现在对话中出现了你关注的关键词，"
+                        "请综合评估上下文后决定是否回复。"
+                    )
                 user_prompt += (
-                    "。现在其中有人发言了（可能连续发了多条），"
-                    "请综合评估所有新消息后决定是否回复。"
                     "如果当前话题已经偏离了你之前关注的原因，将 drifted 设为 true。"
                     "</follow_up_reminder>"
                 )
@@ -413,8 +427,8 @@ class IrisReply(Star):
         logger.info("Iris Reply: trigger raw response for group %s (len=%d): %.500s", group_id, len(completion), completion)
         result = self._parse_trigger(completion)
         logger.info(
-            "Iris Reply: trigger parsed for group %s: reply=%s, drifted=%s, watch=%s",
-            group_id, result.should_reply, result.topic_drifted, result.follow_up_users,
+            "Iris Reply: trigger parsed for group %s: reply=%s, drifted=%s, watch=%s, watch_keywords=%s",
+            group_id, result.should_reply, result.topic_drifted, result.follow_up_users, result.follow_up_keywords,
         )
 
         if result.observation:
@@ -426,6 +440,7 @@ class IrisReply(Star):
             should_reply=result.should_reply,
             observation=result.observation,
             follow_up_users=result.follow_up_users,
+            follow_up_keywords=result.follow_up_keywords,
             interest_reason=result.interest_reason,
             topic_drifted=result.topic_drifted,
         )
@@ -437,19 +452,20 @@ class IrisReply(Star):
             logger.info("Iris Reply: topic drifted for group %s, cleared follow-up", group_id)
             return
 
-        if result.follow_up_users:
+        if result.follow_up_users or result.follow_up_keywords:
             if result.should_reply:
-                self._pending_follow_up[group_id] = (result.follow_up_users, result.interest_reason)
+                self._pending_follow_up[group_id] = (result.follow_up_users, result.follow_up_keywords, result.interest_reason)
             else:
                 async with self._state.get_lock(group_id):
                     self._state.add_follow_up(
                         group_id,
-                        user_ids=result.follow_up_users,
+                        user_ids=result.follow_up_users or None,
+                        keywords=result.follow_up_keywords or None,
                         reason=result.interest_reason,
                     )
             logger.info(
-                "Iris Reply: trigger follow-up for group %s, users=%s, reason=%s (reply=%s)",
-                group_id, result.follow_up_users, result.interest_reason, result.should_reply,
+                "Iris Reply: trigger follow-up for group %s, users=%s, keywords=%s, reason=%s (reply=%s)",
+                group_id, result.follow_up_users, result.follow_up_keywords, result.interest_reason, result.should_reply,
             )
 
         if not result.should_reply:
@@ -506,8 +522,13 @@ class IrisReply(Star):
                 self._state.record_actual_reply(group_id)
                 self._state.clear_follow_up(group_id)
                 if pending:
-                    user_ids, reason = pending
-                    self._state.add_follow_up(group_id, user_ids=user_ids, reason=reason)
+                    user_ids, keywords, reason = pending
+                    self._state.add_follow_up(
+                        group_id,
+                        user_ids=user_ids or None,
+                        keywords=keywords or None,
+                        reason=reason,
+                    )
 
             self._tool_ctx.clear_context()
             await self._state.save_dirty(self._kv_save)
@@ -610,6 +631,10 @@ class IrisReply(Star):
         follow_up_users = cls._parse_string_list(
             obj.get("watch", obj.get("follow_up_users", []))
         )
+        follow_up_keywords = cls._parse_string_list(
+            obj.get("watch_keywords", obj.get("follow_up_keywords", [])),
+            max_len=10,
+        )
         interest_reason = str(
             obj.get("why", obj.get("interest_reason", ""))
         )
@@ -619,6 +644,7 @@ class IrisReply(Star):
             should_reply=should_reply,
             observation=observation,
             follow_up_users=follow_up_users,
+            follow_up_keywords=follow_up_keywords,
             interest_reason=interest_reason,
             topic_drifted=topic_drifted,
         )
@@ -684,6 +710,9 @@ class IrisReply(Star):
                     "effective_t": effective_t,
                     "backoff_level": data.backoff_level,
                     "consecutive_replies": data.consecutive_replies,
+                    "follow_up_users": list(data.follow_up.user_ids),
+                    "follow_up_keywords": list(data.follow_up.keywords),
+                    "follow_up_reason": data.follow_up.reason,
                 })
             return jsonify(groups)
 

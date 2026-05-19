@@ -24,6 +24,14 @@ class TriggerEngine:
             return False
         return self._state.match_follow_up(group_id, sender_id)
 
+    def check_keyword(self, group_id: str, text: str) -> list[str]:
+        data = self._state.get_state(group_id)
+        if data.state == GroupState.COOLDOWN:
+            return []
+        if self._state.is_muted():
+            return []
+        return self._state.match_keyword(group_id, text)
+
     def check_sampling(self, group_id: str) -> bool:
         return self._state.should_trigger_sampling(group_id)
 
@@ -36,11 +44,18 @@ class TriggerEngine:
             return None
 
         sender_id = event.get_sender_id()
+        message_text = event.message_str or ""
 
         if self.check_follow_up(group_id, sender_id):
             logger.debug(f"Iris Reply: follow-up trigger for group {group_id}")
             self._state.reset_sampling(group_id)
             return "follow_up"
+
+        matched_keywords = self.check_keyword(group_id, message_text)
+        if matched_keywords:
+            logger.debug(f"Iris Reply: keyword trigger for group {group_id}, keywords={matched_keywords}")
+            self._state.reset_sampling(group_id)
+            return "keyword_follow_up"
 
         self._state.increment_msg_count(group_id)
 

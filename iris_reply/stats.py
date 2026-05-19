@@ -16,6 +16,7 @@ class LLMCallLog:
     should_reply: bool
     observation: str
     follow_up_users: list[str]
+    follow_up_keywords: list[str]
     interest_reason: str
     topic_drifted: bool
     timestamp: float
@@ -92,6 +93,7 @@ class StatsCollector:
         should_reply: bool,
         observation: str,
         follow_up_users: list[str],
+        follow_up_keywords: list[str],
         interest_reason: str,
         topic_drifted: bool,
     ) -> None:
@@ -112,6 +114,7 @@ class StatsCollector:
             should_reply=should_reply,
             observation=observation,
             follow_up_users=follow_up_users,
+            follow_up_keywords=follow_up_keywords,
             interest_reason=interest_reason,
             topic_drifted=topic_drifted,
             timestamp=time.time(),
@@ -210,6 +213,7 @@ class StatsCollector:
                 "should_reply": log.should_reply,
                 "observation": log.observation,
                 "follow_up_users": log.follow_up_users,
+                "follow_up_keywords": log.follow_up_keywords,
                 "interest_reason": log.interest_reason,
                 "topic_drifted": log.topic_drifted,
                 "timestamp": log.timestamp,
