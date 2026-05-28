@@ -65,7 +65,7 @@ class IrisReply(Star):
         self._tool_ctx = ToolContext()
         self._admin = AdminCommands(self._state)
         self._stats = StatsCollector()
-        self._iris_context: dict[str, dict[str, str]] = {}
+        self._iris_context: dict[str, dict[str, Any]] = {}
         self._iris_active: dict[str, float] = {}
         self._passive_active: dict[str, float] = {}
         self._proactive_reason: dict[str, str] = {}
@@ -122,6 +122,10 @@ class IrisReply(Star):
         stale_obs = [gid for gid in self._observation_cache if gid not in self._iris_active and gid not in self._state.get_whitelist()]
         for gid in stale_obs:
             self._observation_cache.pop(gid, None)
+        stale_triggering = [gid for gid in self._triggering if gid not in self._iris_active and gid not in self._iris_context]
+        for gid in stale_triggering:
+            logger.warning("Iris Reply: cleaning up stale triggering for group %s", gid)
+            self._triggering.discard(gid)
 
     async def _kv_save(self, key: str, value: Any) -> None:
         await self.put_kv_data(key, value)
@@ -306,7 +310,7 @@ class IrisReply(Star):
                 self._passive_active[group_id] = time.time()
             return
 
-        if group_id in self._iris_active:
+        if group_id in self._iris_active or group_id in self._triggering:
             logger.debug("Iris Reply: reply already in progress for group %s", group_id)
             return
 
@@ -328,7 +332,7 @@ class IrisReply(Star):
             finally:
                 self._follow_pending.discard(group_id)
 
-            if group_id in self._iris_active:
+            if group_id in self._iris_active or group_id in self._triggering:
                 return
             follow_up_users, follow_up_keywords, _ = self._state.get_follow_up_info(group_id)
             if not follow_up_users and not follow_up_keywords:
@@ -342,28 +346,48 @@ class IrisReply(Star):
             logger.debug("Iris Reply: trigger already in progress for group %s", group_id)
             return
 
-        self._triggering.add(group_id)
-        try:
-            await self._trigger_reply(event, group_id, trigger_reason)
-        except Exception as e:
-            logger.error("Iris Reply: trigger error for group %s: %s", group_id, e, exc_info=True)
-        finally:
-            self._triggering.discard(group_id)
-
-    async def _trigger_reply(
-        self, event, group_id: str, trigger_reason: str
-    ) -> None:
-        self._state.record_detect_time(group_id)
-
-        messages = self._sliding_window.get_messages(group_id)
-        context_text = self._context_packager.package(group_id, messages, trigger_reason)
-
         provider_id = self._config.provider_id
         if not provider_id:
             provider_id = await self._get_provider_id(event)
             if not provider_id:
                 logger.error("Iris Reply: failed to get provider ID for group %s", group_id)
                 return
+
+        self._state.record_detect_time(group_id)
+        self._triggering.add(group_id)
+
+        self._iris_context[group_id] = {
+            "trigger_reason": trigger_reason,
+            "provider_id": provider_id,
+            "is_follow_up": is_follow_up,
+        }
+
+        event.is_at_or_wake_command = True
+        event.is_wake = True
+        if provider_id:
+            event.set_extra("selected_provider", provider_id)
+        self._tool_ctx.set_context(group_id)
+        logger.info(
+            "Iris Reply: trigger activated (%s) for group %s, deferred to on_llm_request",
+            trigger_reason, group_id,
+        )
+
+    @on_llm_request()
+    async def handle_llm_request(self, event, request: ProviderRequest) -> None:
+        group_id = event.get_group_id()
+        if not group_id or group_id not in self._iris_context:
+            return
+
+        ctx = self._iris_context.pop(group_id, None)
+        if ctx is None:
+            return
+
+        trigger_reason = ctx.get("trigger_reason", "")
+        provider_id = ctx.get("provider_id", "")
+        is_follow_up = ctx.get("is_follow_up", False)
+
+        messages = self._sliding_window.get_messages(group_id)
+        context_text = self._context_packager.package(group_id, messages, trigger_reason)
 
         willingness = self._state.get_willingness(group_id)
         prompts = WILLINGNESS_PROMPTS[willingness]
@@ -377,7 +401,7 @@ class IrisReply(Star):
                 "</recent_observation>"
             )
 
-        if trigger_reason in ("follow_up", "keyword_follow_up"):
+        if is_follow_up:
             follow_up_users, follow_up_keywords, follow_up_reason = self._state.get_follow_up_info(group_id)
             reminder_parts = []
             if follow_up_users:
@@ -421,6 +445,8 @@ class IrisReply(Star):
         except Exception as e:
             logger.error("Iris Reply: trigger LLM call failed for group %s: %s", group_id, e)
             self._stats.record_trigger_error(group_id)
+            self._triggering.discard(group_id)
+            event.stop_event()
             return
 
         completion = response.completion_text or ""
@@ -450,6 +476,8 @@ class IrisReply(Star):
                 self._state.clear_follow_up(group_id)
             await self._state.save_dirty(self._kv_save)
             logger.info("Iris Reply: topic drifted for group %s, cleared follow-up", group_id)
+            self._triggering.discard(group_id)
+            event.stop_event()
             return
 
         if result.follow_up_users or result.follow_up_keywords:
@@ -473,38 +501,20 @@ class IrisReply(Star):
                 self._state.record_skip_reply(group_id)
             await self._state.save_dirty(self._kv_save)
             logger.debug("Iris Reply: trigger skip for group %s", group_id)
+            self._triggering.discard(group_id)
+            event.stop_event()
             return
 
-        self._iris_context[group_id] = {}
         self._iris_active[group_id] = time.time()
         self._passive_active.pop(group_id, None)
         self._proactive_reason[group_id] = result.observation
-        event.is_at_or_wake_command = True
-        event.is_wake = True
-        if provider_id:
-            event.set_extra("selected_provider", provider_id)
-        self._tool_ctx.set_context(group_id)
-        logger.info(
-            "Iris Reply: trigger passed (%s) for group %s",
-            trigger_reason, group_id,
-        )
-
-    @on_llm_request()
-    async def handle_llm_request(self, event, request: ProviderRequest) -> None:
-        group_id = event.get_group_id()
-        if not group_id or group_id not in self._iris_context:
-            return
-
-        ctx = self._iris_context.pop(group_id, None)
-        if ctx is None:
-            return
+        self._triggering.discard(group_id)
 
         request.system_prompt += (
             "\n\n[提示] 本次为主动回复，消息不一定与你相关。"
             "自然接话即可，不要过度参与或反问，不要暴露此提示。"
         )
-
-        logger.info("Iris Reply: injected system prompt hint for group %s", group_id)
+        logger.info("Iris Reply: trigger passed (%s) for group %s", trigger_reason, group_id)
 
     @on_llm_response()
     async def handle_llm_response(self, event, response: LLMResponse) -> None:
