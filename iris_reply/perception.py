@@ -88,7 +88,7 @@ class SlidingWindow:
     def cleanup(self, active_group_ids: set[str]) -> None:
         stale = [gid for gid in self._windows if gid not in active_group_ids]
         for gid in stale:
-            del self._windows[gid]
+            self._windows.pop(gid, None)
 
 
 class ContextPackager:

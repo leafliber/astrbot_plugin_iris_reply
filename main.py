@@ -3,15 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-import sys
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
-
-_plugin_dir = str(Path(__file__).parent)
-if _plugin_dir not in sys.path:
-    sys.path.insert(0, _plugin_dir)
 
 from astrbot.api import logger
 from astrbot.api.event.filter import (
@@ -28,14 +22,14 @@ from astrbot.api.event.filter import PermissionType
 from astrbot.api.star import Context, Star
 from astrbot.core.provider.entities import LLMResponse, ProviderRequest
 
-from iris_reply.admin import AdminCommands
-from iris_reply.config import ConfigManager
-from iris_reply.perception import ContextPackager, Gatekeeper, SlidingWindow, WindowMessage
-from iris_reply.prompts import WILLINGNESS_PROMPTS
-from iris_reply.state import StateManager
-from iris_reply.stats import StatsCollector
-from iris_reply.tools import ToolContext
-from iris_reply.trigger import TriggerEngine
+from .iris_reply.admin import AdminCommands
+from .iris_reply.config import ConfigManager
+from .iris_reply.perception import ContextPackager, Gatekeeper, SlidingWindow, WindowMessage
+from .iris_reply.prompts import WILLINGNESS_PROMPTS
+from .iris_reply.state import StateManager
+from .iris_reply.stats import StatsCollector
+from .iris_reply.tools import ToolContext
+from .iris_reply.trigger import TriggerEngine
 
 PLUGIN_NAME = "astrbot_plugin_iris_reply"
 
@@ -50,6 +44,7 @@ class TriggerResult:
     follow_up_keywords: list[str] = field(default_factory=list)
     interest_reason: str = ""
     topic_drifted: bool = False
+    parse_failed: bool = False
 
 
 class IrisReply(Star):
@@ -116,7 +111,7 @@ class IrisReply(Star):
         for gid in stale_passive:
             logger.warning("Iris Reply: cleaning up stale passive for group %s (timeout)", gid)
             self._passive_active.pop(gid, None)
-        stale_proactive = [gid for gid in self._proactive_reason]
+        stale_proactive = [gid for gid in self._proactive_reason if gid not in self._iris_active]
         for gid in stale_proactive:
             self._proactive_reason.pop(gid, None)
         stale_obs = [gid for gid in self._observation_cache if gid not in self._iris_active and gid not in self._state.get_whitelist()]
@@ -342,10 +337,6 @@ class IrisReply(Star):
             logger.debug("Iris Reply: trigger rate-limited for group %s", group_id)
             return
 
-        if group_id in self._triggering:
-            logger.debug("Iris Reply: trigger already in progress for group %s", group_id)
-            return
-
         provider_id = self._config.provider_id
         if not provider_id:
             provider_id = await self._get_provider_id(event)
@@ -353,8 +344,12 @@ class IrisReply(Star):
                 logger.error("Iris Reply: failed to get provider ID for group %s", group_id)
                 return
 
-        self._state.record_detect_time(group_id)
-        self._triggering.add(group_id)
+        async with self._state.get_lock(group_id):
+            if group_id in self._triggering:
+                logger.debug("Iris Reply: trigger already in progress for group %s", group_id)
+                return
+            self._state.record_detect_time(group_id)
+            self._triggering.add(group_id)
 
         self._iris_context[group_id] = {
             "trigger_reason": trigger_reason,
@@ -470,6 +465,12 @@ class IrisReply(Star):
             interest_reason=result.interest_reason,
             topic_drifted=result.topic_drifted,
         )
+
+        if result.parse_failed:
+            logger.warning("Iris Reply: trigger parse failed for group %s, skipping without backoff", group_id)
+            self._triggering.discard(group_id)
+            event.stop_event()
+            return
 
         if result.topic_drifted:
             async with self._state.get_lock(group_id):
@@ -630,7 +631,7 @@ class IrisReply(Star):
         obj = cls._extract_json(text)
         if not obj:
             logger.warning("Iris Reply: trigger JSON parse failed, raw text: %.300s", text)
-            return TriggerResult()
+            return TriggerResult(parse_failed=True)
 
         should_reply = cls._parse_bool(
             obj.get("reply", obj.get("should_reply", False))
@@ -688,8 +689,13 @@ class IrisReply(Star):
         async def _stats_logs():
             from quart import request as qrequest
             group_id = qrequest.args.get("group_id", "")
-            limit = int(qrequest.args.get("limit", "50"))
-            offset = int(qrequest.args.get("offset", "0"))
+            try:
+                limit = int(qrequest.args.get("limit", "50"))
+                offset = int(qrequest.args.get("offset", "0"))
+            except (ValueError, TypeError):
+                limit, offset = 50, 0
+            limit = max(1, min(200, limit))
+            offset = max(0, offset)
             return jsonify(self._stats.get_llm_logs(
                 group_id=group_id or None,
                 limit=limit,
@@ -755,7 +761,7 @@ class IrisReply(Star):
             level = body.get("willingness", "")
             if not group_id or not level:
                 return jsonify({"error": "group_id and willingness required"}), 400
-            from iris_reply.prompts import resolve_level
+            from .iris_reply.prompts import resolve_level
             resolved = resolve_level(level)
             if not resolved:
                 return jsonify({"error": "invalid willingness level"}), 400

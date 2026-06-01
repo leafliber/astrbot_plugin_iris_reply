@@ -72,6 +72,7 @@ class StateManager:
         self._dirty_groups: set[str] = set()
         self._global_lock = asyncio.Lock()
         self._whitelist: set[str] = set()
+        self._whitelist_dirty: bool = False
 
     def get_lock(self, group_id: str) -> asyncio.Lock:
         return self._locks.setdefault(group_id, asyncio.Lock())
@@ -201,7 +202,7 @@ class StateManager:
 
     def get_follow_up_info(self, group_id: str) -> tuple[set[str], set[str], str]:
         data = self.get_state(group_id)
-        return data.follow_up.user_ids, data.follow_up.keywords, data.follow_up.reason
+        return set(data.follow_up.user_ids), set(data.follow_up.keywords), data.follow_up.reason
 
     def increment_msg_count(self, group_id: str) -> int:
         data = self._ensure_group(group_id)
@@ -385,6 +386,12 @@ class StateManager:
 
     async def save_dirty(self, save_fn) -> None:
         async with self._global_lock:
+            if self._whitelist_dirty:
+                try:
+                    await save_fn("iris_reply:whitelist", list(self._whitelist))
+                    self._whitelist_dirty = False
+                except Exception as e:
+                    logger.warning("Iris Reply: whitelist KV save failed: %s", e)
             processed = set()
             for gid in list(self._dirty_groups):
                 data = self._groups.get(gid)
@@ -415,9 +422,11 @@ class StateManager:
 
     def add_to_whitelist(self, group_id: str) -> None:
         self._whitelist.add(group_id)
+        self._whitelist_dirty = True
 
     def remove_from_whitelist(self, group_id: str) -> None:
         self._whitelist.discard(group_id)
+        self._whitelist_dirty = True
 
     def get_whitelist(self) -> set[str]:
         return set(self._whitelist)
@@ -442,6 +451,7 @@ class StateManager:
         async with self._global_lock:
             try:
                 await save_fn("iris_reply:whitelist", list(self._whitelist))
+                self._whitelist_dirty = False
             except Exception as e:
                 logger.warning("Iris Reply: whitelist KV save failed: %s", e)
             all_data = {}
