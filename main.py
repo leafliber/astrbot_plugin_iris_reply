@@ -68,6 +68,7 @@ class IrisReply(Star):
         self._observation_cache: dict[str, str] = {}
         self._triggering: set[str] = set()
         self._follow_pending: set[str] = set()
+        self._passive_eval_pending: set[str] = set()
         self._save_task: asyncio.Task | None = None
         self._save_interval = 30
 
@@ -121,6 +122,10 @@ class IrisReply(Star):
         for gid in stale_triggering:
             logger.warning("Iris Reply: cleaning up stale triggering for group %s", gid)
             self._triggering.discard(gid)
+        stale_eval = [gid for gid in self._passive_eval_pending if gid not in self._iris_active]
+        for gid in stale_eval:
+            logger.debug("Iris Reply: cleaning up stale passive eval for group %s", gid)
+            self._passive_eval_pending.discard(gid)
 
     async def _kv_save(self, key: str, value: Any) -> None:
         await self.put_kv_data(key, value)
@@ -282,12 +287,14 @@ class IrisReply(Star):
             return
 
         message_str = event.message_str or ""
-        score = self._gatekeeper.quality_score(message_str)
-        if score < self._config.quality_threshold:
-            return
-
         sender_id = event.get_sender_id()
         sender_name = event.get_sender_name() or sender_id
+
+        is_followed = bool(sender_id and self._state.match_follow_up(group_id, sender_id))
+
+        score = self._gatekeeper.quality_score(message_str)
+        if score < self._config.quality_threshold and not is_followed:
+            return
 
         self._sliding_window.append(
             group_id,
@@ -300,6 +307,10 @@ class IrisReply(Star):
         )
 
         if event.is_at_or_wake_command:
+            if group_id in self._iris_context:
+                self._iris_context.pop(group_id, None)
+                self._triggering.discard(group_id)
+                logger.debug("Iris Reply: cancelled pending proactive trigger for group %s due to user LLM request", group_id)
             self._state.increment_msg_count(group_id)
             if group_id not in self._iris_active:
                 self._passive_active[group_id] = time.time()
@@ -440,6 +451,9 @@ class IrisReply(Star):
         except Exception as e:
             logger.error("Iris Reply: trigger LLM call failed for group %s: %s", group_id, e)
             self._stats.record_trigger_error(group_id)
+            async with self._state.get_lock(group_id):
+                self._state.record_skip_reply(group_id)
+            await self._state.save_dirty(self._kv_save)
             self._triggering.discard(group_id)
             event.stop_event()
             return
@@ -468,6 +482,18 @@ class IrisReply(Star):
 
         if result.parse_failed:
             logger.warning("Iris Reply: trigger parse failed for group %s, skipping without backoff", group_id)
+            async with self._state.get_lock(group_id):
+                self._state.record_skip_reply(group_id)
+            await self._state.save_dirty(self._kv_save)
+            self._triggering.discard(group_id)
+            event.stop_event()
+            return
+
+        if group_id in self._passive_active:
+            logger.info("Iris Reply: aborting proactive trigger for group %s, passive reply in progress", group_id)
+            async with self._state.get_lock(group_id):
+                self._state.record_skip_reply(group_id)
+            await self._state.save_dirty(self._kv_save)
             self._triggering.discard(group_id)
             event.stop_event()
             return
@@ -546,6 +572,7 @@ class IrisReply(Star):
             logger.info("Iris Reply: actual reply sent for group %s, follow-up updated", group_id)
         elif group_id in self._passive_active:
             self._passive_active.pop(group_id, None)
+            self._passive_eval_pending.add(group_id)
 
             async with self._state.get_lock(group_id):
                 self._state.record_actual_reply(group_id, count_consecutive=False)
@@ -571,10 +598,103 @@ class IrisReply(Star):
             await self._state.save_dirty(self._kv_save)
             logger.debug("Iris Reply: short-TTL follow-up sender %s in group %s after proactive reply", sender_id, group_id)
             return
+        if group_id in self._passive_eval_pending:
+            self._passive_eval_pending.discard(group_id)
+            provider_id = self._config.provider_id or await self._get_provider_id(event)
+            if provider_id:
+                await self._passive_follow_up_eval(group_id, provider_id, sender_id)
+            else:
+                async with self._state.get_lock(group_id):
+                    self._state.add_follow_up(group_id, user_ids=[sender_id])
+                await self._state.save_dirty(self._kv_save)
+            return
         async with self._state.get_lock(group_id):
             self._state.add_follow_up(group_id, user_ids=[sender_id])
         await self._state.save_dirty(self._kv_save)
         logger.debug("Iris Reply: auto follow-up sender %s in group %s after message sent", sender_id, group_id)
+
+    async def _passive_follow_up_eval(
+        self, group_id: str, provider_id: str, fallback_sender: str,
+    ) -> None:
+        messages = self._sliding_window.get_messages(group_id)
+        if not messages:
+            return
+
+        context_text = self._context_packager.package(group_id, messages, "passive")
+
+        willingness = self._state.get_willingness(group_id)
+        prompts = WILLINGNESS_PROMPTS[willingness]
+        user_prompt = (
+            prompts["persona"]
+            + "\n\n<instruction>本次为被动回复后的跟进评估，你必须将 reply 设为 false，"
+            "只需判断是否需要关注后续对话。</instruction>"
+        )
+
+        cached_obs = self._observation_cache.get(group_id)
+        if cached_obs:
+            user_prompt += (
+                f"\n\n<recent_observation>之前的观察：{cached_obs}</recent_observation>"
+            )
+
+        follow_up_users, follow_up_keywords, follow_up_reason = self._state.get_follow_up_info(group_id)
+        if follow_up_users or follow_up_keywords:
+            reminder_parts = []
+            if follow_up_users:
+                reminder_parts.append(f"你之前表示对这些用户感兴趣：{', '.join(follow_up_users)}")
+            if follow_up_keywords:
+                reminder_parts.append(f"你之前表示对这些关键词感兴趣：{', '.join(follow_up_keywords)}")
+            if reminder_parts:
+                user_prompt += (
+                    f"\n\n<follow_up_reminder>{'；'.join(reminder_parts)}"
+                )
+                if follow_up_reason:
+                    user_prompt += f"，原因：{follow_up_reason}"
+                user_prompt += "</follow_up_reminder>"
+
+        user_prompt += "\n\n" + context_text
+
+        try:
+            response = await self.context.llm_generate(
+                chat_provider_id=provider_id,
+                prompt=user_prompt,
+                system_prompt=prompts["trigger_system"],
+            )
+        except Exception as e:
+            logger.warning("Iris Reply: passive follow-up eval failed for group %s: %s", group_id, e)
+            async with self._state.get_lock(group_id):
+                self._state.add_follow_up(group_id, user_ids=[fallback_sender])
+            await self._state.save_dirty(self._kv_save)
+            return
+
+        result = self._parse_trigger(response.completion_text or "")
+        logger.info(
+            "Iris Reply: passive eval for group %s: watch=%s, keywords=%s, drifted=%s",
+            group_id, result.follow_up_users, result.follow_up_keywords, result.topic_drifted,
+        )
+
+        if result.observation:
+            self._observation_cache[group_id] = result.observation
+
+        if result.topic_drifted:
+            async with self._state.get_lock(group_id):
+                self._state.clear_follow_up(group_id)
+            await self._state.save_dirty(self._kv_save)
+            logger.info("Iris Reply: topic drifted (passive) for group %s, cleared follow-up", group_id)
+            return
+
+        if result.follow_up_users or result.follow_up_keywords:
+            async with self._state.get_lock(group_id):
+                self._state.add_follow_up(
+                    group_id,
+                    user_ids=result.follow_up_users or None,
+                    keywords=result.follow_up_keywords or None,
+                    reason=result.interest_reason,
+                )
+            await self._state.save_dirty(self._kv_save)
+        else:
+            async with self._state.get_lock(group_id):
+                self._state.add_follow_up(group_id, user_ids=[fallback_sender])
+            await self._state.save_dirty(self._kv_save)
 
     @staticmethod
     def _extract_json(text: str) -> dict | None:
