@@ -106,12 +106,12 @@ class IrisReply(Star):
         now = time.time()
         stale = [gid for gid, ts in self._iris_active.items() if now - ts > _IRIS_ACTIVE_TIMEOUT]
         for gid in stale:
-            logger.warning("Iris Reply: cleaning up stale active for group %s (timeout)", gid)
+            logger.info("Iris Reply: cleaning up stale active for group %s (timeout)", gid)
             self._iris_active.pop(gid, None)
             self._iris_context.pop(gid, None)
         stale_passive = [gid for gid, ts in self._passive_active.items() if now - ts > _IRIS_ACTIVE_TIMEOUT]
         for gid in stale_passive:
-            logger.warning("Iris Reply: cleaning up stale passive for group %s (timeout)", gid)
+            logger.info("Iris Reply: cleaning up stale passive for group %s (timeout)", gid)
             self._passive_active.pop(gid, None)
         stale_proactive = [gid for gid in self._proactive_reason if gid not in self._iris_active]
         for gid in stale_proactive:
@@ -121,7 +121,7 @@ class IrisReply(Star):
             self._observation_cache.pop(gid, None)
         stale_triggering = [gid for gid in self._triggering if gid not in self._iris_active and gid not in self._iris_context]
         for gid in stale_triggering:
-            logger.warning("Iris Reply: cleaning up stale triggering for group %s", gid)
+            logger.info("Iris Reply: cleaning up stale triggering for group %s", gid)
             self._triggering.discard(gid)
         stale_eval = [gid for gid in self._passive_eval_pending if gid not in self._iris_active]
         for gid in stale_eval:
