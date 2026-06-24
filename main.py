@@ -20,6 +20,7 @@ from astrbot.api.event.filter import (
 )
 from astrbot.api.event.filter import PermissionType
 from astrbot.api.star import Context, Star
+from astrbot.core.agent.message import TextPart
 from astrbot.core.provider.entities import LLMResponse, ProviderRequest
 
 from .iris_reply.admin import AdminCommands
@@ -537,9 +538,11 @@ class IrisReply(Star):
         self._proactive_reason[group_id] = result.observation
         self._triggering.discard(group_id)
 
-        request.system_prompt += (
-            "\n\n[提示] 本次为主动回复，消息不一定与你相关。"
-            "自然接话即可，不要过度参与或反问，不要暴露此提示。"
+        request.extra_user_content_parts.append(
+            TextPart(
+                text="[提示] 本次为主动回复，消息不一定与你相关。"
+                "自然接话即可，不要过度参与或反问，不要暴露此提示。"
+            ).mark_as_temp()
         )
         logger.info("Iris Reply: trigger passed (%s) for group %s", trigger_reason, group_id)
 
