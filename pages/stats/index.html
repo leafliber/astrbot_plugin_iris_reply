@@ -267,6 +267,76 @@
     .add-group-row input::placeholder { color: #666; }
 
     .muted { color: #666; font-size: 12px; }
+
+    .config-section {
+      background: #161825;
+      border: 1px solid #222;
+      border-radius: 8px;
+      padding: 20px;
+      margin-bottom: 16px;
+    }
+    .config-section h3 {
+      font-size: 14px;
+      color: #ccc;
+      margin-bottom: 16px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid #222;
+    }
+    .config-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+    .config-row label {
+      flex: 0 0 220px;
+      font-size: 13px;
+      color: #ccc;
+    }
+    .config-row .config-hint {
+      flex: 0 0 200px;
+      font-size: 11px;
+      color: #666;
+    }
+    .config-row input[type="number"],
+    .config-row input[type="text"] {
+      background: #1e2030;
+      color: #e0e0e0;
+      border: 1px solid #333;
+      border-radius: 6px;
+      padding: 6px 10px;
+      font-size: 13px;
+      width: 100px;
+    }
+    .config-row input:focus { outline: none; border-color: #6c8aff; }
+    .config-sub-group {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .config-sub-item {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .config-sub-item span {
+      font-size: 12px;
+      color: #888;
+    }
+    .config-sub-item input {
+      width: 60px !important;
+    }
+    .config-save-bar {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      margin-top: 16px;
+    }
+    .config-msg {
+      font-size: 13px;
+      color: #4ade80;
+    }
+    .config-msg.error { color: #f87171; }
   </style>
 </head>
 <body>
@@ -274,11 +344,15 @@
   <div class="tabs">
     <div class="tab active" data-tab="manage">群聊管理</div>
     <div class="tab" data-tab="stats">统计监控</div>
+    <div class="tab" data-tab="settings">设置</div>
   </div>
   <div id="tab-manage" class="tab-content active">
     <div class="loading">加载中...</div>
   </div>
   <div id="tab-stats" class="tab-content">
+    <div class="loading">加载中...</div>
+  </div>
+  <div id="tab-settings" class="tab-content">
     <div class="loading">加载中...</div>
   </div>
   <script type="module" src="./app.js"></script>

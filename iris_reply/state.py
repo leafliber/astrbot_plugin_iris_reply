@@ -65,6 +65,10 @@ class StateManager:
     BACKOFF_DECAY_INTERVAL = 300.0
     AUTO_ADJUST_DECAY_INTERVAL = 600.0
 
+    _GROUP_IDS_KEY = "iris_reply:group_ids"
+    _GROUP_KEY_PREFIX = "state:"
+    _LEGACY_BULK_KEY = "iris_reply:all_groups"
+
     def __init__(self, config: ConfigManager) -> None:
         self._config = config
         self._groups: dict[str, GroupStateData] = {}
@@ -73,6 +77,7 @@ class StateManager:
         self._global_lock = asyncio.Lock()
         self._whitelist: set[str] = set()
         self._whitelist_dirty: bool = False
+        self._group_ids_dirty: bool = False
 
     def get_lock(self, group_id: str) -> asyncio.Lock:
         return self._locks.setdefault(group_id, asyncio.Lock())
@@ -89,6 +94,7 @@ class StateManager:
             self._groups[group_id] = GroupStateData(
                 last_sample_time=time.time(),
             )
+            self._group_ids_dirty = True
         return self._groups[group_id]
 
     def get_state(self, group_id: str) -> GroupStateData:
@@ -114,12 +120,13 @@ class StateManager:
             return start_mins <= current_mins < end_mins
         return current_mins >= start_mins or current_mins < end_mins
 
-    def set_cooldown(self, group_id: str, minutes: int) -> None:
+    def set_cooldown(self, group_id: str, minutes: int) -> int:
         data = self._ensure_group(group_id)
-        minutes = max(1, min(120, minutes))
+        minutes = max(1, min(self.N_MAX, minutes))
         data.state = GroupState.COOLDOWN
         data.cooldown_until = time.time() + minutes * 60
         self._mark_dirty(group_id, data)
+        return minutes
 
     def add_follow_up(
         self,
@@ -200,9 +207,9 @@ class StateManager:
                 matched.append(kw)
         return matched
 
-    def get_follow_up_info(self, group_id: str) -> tuple[set[str], set[str], str]:
+    def get_follow_up_info(self, group_id: str) -> tuple[list[str], list[str], str]:
         data = self.get_state(group_id)
-        return set(data.follow_up.user_ids), set(data.follow_up.keywords), data.follow_up.reason
+        return sorted(data.follow_up.user_ids), sorted(data.follow_up.keywords), data.follow_up.reason
 
     def increment_msg_count(self, group_id: str) -> int:
         data = self._ensure_group(group_id)
@@ -387,22 +394,36 @@ class StateManager:
     async def save_dirty(self, save_fn) -> None:
         async with self._global_lock:
             if self._whitelist_dirty:
+                self._whitelist_dirty = False
                 try:
                     await save_fn("iris_reply:whitelist", list(self._whitelist))
-                    self._whitelist_dirty = False
                 except Exception as e:
+                    self._whitelist_dirty = True
                     logger.warning("Iris Reply: whitelist KV save failed: %s", e)
-            processed = set()
-            for gid in list(self._dirty_groups):
+            if self._group_ids_dirty:
+                self._group_ids_dirty = False
+                try:
+                    await save_fn(self._GROUP_IDS_KEY, list(self._groups.keys()))
+                except Exception as e:
+                    self._group_ids_dirty = True
+                    logger.warning("Iris Reply: group manifest KV save failed: %s", e)
+            dirty_snapshot = list(self._dirty_groups)
+            self._dirty_groups.clear()
+            for gid in dirty_snapshot:
                 data = self._groups.get(gid)
-                if data and data.dirty:
-                    try:
-                        await save_fn(f"state:{gid}", self._serialize_group(data))
-                        data.dirty = False
-                        processed.add(gid)
-                    except Exception as e:
-                        logger.warning("Iris Reply: KV save failed for group %s: %s", gid, e)
-            self._dirty_groups -= processed
+                if data:
+                    data.dirty = False
+            for gid in dirty_snapshot:
+                data = self._groups.get(gid)
+                if not data:
+                    continue
+                snapshot = self._serialize_group(data)
+                try:
+                    await save_fn(f"{self._GROUP_KEY_PREFIX}{gid}", snapshot)
+                except Exception as e:
+                    data.dirty = True
+                    self._dirty_groups.add(gid)
+                    logger.warning("Iris Reply: KV save failed for group %s: %s", gid, e)
 
     def get_willingness(self, group_id: str) -> str:
         data = self._ensure_group(group_id)
@@ -438,14 +459,28 @@ class StateManager:
                 self._whitelist = set(str(g) for g in wl_data)
         except Exception as e:
             logger.warning("Iris Reply: whitelist KV load failed: %s", e)
+
+        loaded_any = False
         try:
-            all_data = await load_fn("iris_reply:all_groups")
-            if not all_data or not isinstance(all_data, dict):
-                return
-            for gid, gdata in all_data.items():
-                self._groups[gid] = self._deserialize_group(gdata)
+            group_ids = await load_fn(self._GROUP_IDS_KEY)
+            if group_ids and isinstance(group_ids, list):
+                for gid in group_ids:
+                    gdata = await load_fn(f"{self._GROUP_KEY_PREFIX}{str(gid)}")
+                    if gdata and isinstance(gdata, dict):
+                        self._groups[str(gid)] = self._deserialize_group(gdata)
+                        loaded_any = True
         except Exception as e:
-            logger.warning("Iris Reply: KV load failed, running in memory-only mode: %s", e)
+            logger.warning("Iris Reply: per-group KV load failed: %s", e)
+
+        if not loaded_any:
+            try:
+                all_data = await load_fn(self._LEGACY_BULK_KEY)
+                if all_data and isinstance(all_data, dict):
+                    for gid, gdata in all_data.items():
+                        self._groups[str(gid)] = self._deserialize_group(gdata)
+                    logger.info("Iris Reply: loaded %d groups from legacy bulk format", len(all_data))
+            except Exception as e:
+                logger.warning("Iris Reply: KV load failed, running in memory-only mode: %s", e)
 
     async def save_all(self, save_fn) -> None:
         async with self._global_lock:
@@ -454,15 +489,27 @@ class StateManager:
                 self._whitelist_dirty = False
             except Exception as e:
                 logger.warning("Iris Reply: whitelist KV save failed: %s", e)
-            all_data = {}
-            for gid, data in self._groups.items():
-                all_data[gid] = self._serialize_group(data)
-                data.dirty = False
-            try:
-                await save_fn("iris_reply:all_groups", all_data)
-            except Exception as e:
-                logger.warning("Iris Reply: KV save all failed: %s", e)
+            all_gids = list(self._groups.keys())
             self._dirty_groups.clear()
+            for gid, data in self._groups.items():
+                data.dirty = False
+            for gid in all_gids:
+                data = self._groups.get(gid)
+                if not data:
+                    continue
+                snapshot = self._serialize_group(data)
+                try:
+                    await save_fn(f"{self._GROUP_KEY_PREFIX}{gid}", snapshot)
+                except Exception as e:
+                    data.dirty = True
+                    self._dirty_groups.add(gid)
+                    logger.warning("Iris Reply: KV save failed for group %s: %s", gid, e)
+            try:
+                await save_fn(self._GROUP_IDS_KEY, list(self._groups.keys()))
+                self._group_ids_dirty = False
+            except Exception as e:
+                self._group_ids_dirty = True
+                logger.warning("Iris Reply: group manifest KV save failed: %s", e)
 
     def _serialize_group(self, data: GroupStateData) -> dict[str, Any]:
         return {

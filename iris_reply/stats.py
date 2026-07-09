@@ -29,6 +29,7 @@ class GroupStats:
     total_triggers: int = 0
     total_replies: int = 0
     total_skips: int = 0
+    total_errors: int = 0
     total_drifts: int = 0
     total_passive_replies: int = 0
     last_trigger_time: float = 0.0
@@ -136,7 +137,7 @@ class StatsCollector:
             return
         self._pending_call.pop(group_id, None)
         gs = self._ensure_group(group_id)
-        gs.total_skips += 1
+        gs.total_errors += 1
 
     def record_passive_reply(self, group_id: str) -> None:
         if not self._enabled:
@@ -175,6 +176,7 @@ class StatsCollector:
                 "total_triggers": gs.total_triggers,
                 "total_replies": gs.total_replies,
                 "total_skips": gs.total_skips,
+                "total_errors": gs.total_errors,
                 "total_drifts": gs.total_drifts,
                 "total_passive_replies": gs.total_passive_replies,
                 "last_trigger_time": gs.last_trigger_time,
@@ -230,6 +232,7 @@ class StatsCollector:
             "total_triggers": gs.total_triggers,
             "total_replies": gs.total_replies,
             "total_skips": gs.total_skips,
+            "total_errors": gs.total_errors,
             "total_drifts": gs.total_drifts,
             "total_passive_replies": gs.total_passive_replies,
             "last_trigger_time": gs.last_trigger_time,

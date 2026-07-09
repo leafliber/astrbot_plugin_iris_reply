@@ -61,20 +61,18 @@ class IrisReply(Star):
         self._tool_ctx = ToolContext()
         self._admin = AdminCommands(self._state)
         self._stats = StatsCollector()
-        self._iris_context: dict[str, dict[str, Any]] = {}
-        self._iris_active: dict[str, float] = {}
+        self._reply_in_progress: dict[str, float] = {}
         self._passive_active: dict[str, float] = {}
-        self._proactive_reason: dict[str, str] = {}
-        self._pending_follow_up: dict[str, tuple[list[str], list[str], str]] = {}
         self._observation_cache: dict[str, str] = {}
-        self._triggering: set[str] = set()
+        self._triggering: dict[str, float] = {}
         self._follow_pending: set[str] = set()
-        self._passive_eval_pending: set[str] = set()
         self._save_task: asyncio.Task | None = None
         self._save_interval = 30
 
     async def initialize(self) -> None:
         await self._state.load_all(self._kv_load)
+        config_overrides = await self._kv_load("iris_reply:config_overrides")
+        self._config.load_overrides(config_overrides)
         self._save_task = asyncio.create_task(self._periodic_save())
         self._stats.enabled = self._config.stats_enabled
         self._register_stats_api()
@@ -88,7 +86,11 @@ class IrisReply(Star):
             except asyncio.CancelledError:
                 pass
         await self._state.save_all(self._kv_save)
+        await self._kv_save("iris_reply:config_overrides", self._config.get_overrides())
         self._follow_pending.clear()
+        self._reply_in_progress.clear()
+        self._passive_active.clear()
+        self._triggering.clear()
         logger.info("Iris Reply: terminated")
 
     async def _periodic_save(self) -> None:
@@ -96,6 +98,7 @@ class IrisReply(Star):
             await asyncio.sleep(self._save_interval)
             try:
                 await self._state.save_dirty(self._kv_save)
+                await self._kv_save("iris_reply:config_overrides", self._config.get_overrides())
                 self._sliding_window.cleanup(self._state.get_whitelist())
                 self._cleanup_stale_active()
                 self._sync_stats_group_state()
@@ -104,29 +107,22 @@ class IrisReply(Star):
 
     def _cleanup_stale_active(self) -> None:
         now = time.time()
-        stale = [gid for gid, ts in self._iris_active.items() if now - ts > _IRIS_ACTIVE_TIMEOUT]
-        for gid in stale:
-            logger.info("Iris Reply: cleaning up stale active for group %s (timeout)", gid)
-            self._iris_active.pop(gid, None)
-            self._iris_context.pop(gid, None)
+        stale_rip = [gid for gid, ts in self._reply_in_progress.items() if now - ts > _IRIS_ACTIVE_TIMEOUT]
+        for gid in stale_rip:
+            logger.info("Iris Reply: cleaning up stale reply_in_progress for group %s (timeout)", gid)
+            self._reply_in_progress.pop(gid, None)
         stale_passive = [gid for gid, ts in self._passive_active.items() if now - ts > _IRIS_ACTIVE_TIMEOUT]
         for gid in stale_passive:
             logger.info("Iris Reply: cleaning up stale passive for group %s (timeout)", gid)
             self._passive_active.pop(gid, None)
-        stale_proactive = [gid for gid in self._proactive_reason if gid not in self._iris_active]
-        for gid in stale_proactive:
-            self._proactive_reason.pop(gid, None)
-        stale_obs = [gid for gid in self._observation_cache if gid not in self._iris_active and gid not in self._state.get_whitelist()]
-        for gid in stale_obs:
-            self._observation_cache.pop(gid, None)
-        stale_triggering = [gid for gid in self._triggering if gid not in self._iris_active and gid not in self._iris_context]
+        stale_triggering = [gid for gid, ts in self._triggering.items()
+                            if gid not in self._reply_in_progress and now - ts > _IRIS_ACTIVE_TIMEOUT]
         for gid in stale_triggering:
             logger.info("Iris Reply: cleaning up stale triggering for group %s", gid)
-            self._triggering.discard(gid)
-        stale_eval = [gid for gid in self._passive_eval_pending if gid not in self._iris_active]
-        for gid in stale_eval:
-            logger.debug("Iris Reply: cleaning up stale passive eval for group %s", gid)
-            self._passive_eval_pending.discard(gid)
+            self._triggering.pop(gid, None)
+        stale_obs = [gid for gid in self._observation_cache if gid not in self._reply_in_progress and gid not in self._triggering]
+        for gid in stale_obs:
+            self._observation_cache.pop(gid, None)
 
     async def _kv_save(self, key: str, value: Any) -> None:
         await self.put_kv_data(key, value)
@@ -206,9 +202,9 @@ class IrisReply(Star):
             return "error: no group context"
 
         async with self._state.get_lock(group_id):
-            self._state.set_cooldown(group_id, minutes)
-        logger.debug("Iris Reply: set_cooldown for group %s, %d min", group_id, minutes)
-        return f"ok: cooldown set for {max(1, min(120, int(minutes)))} minutes"
+            actual = self._state.set_cooldown(group_id, minutes)
+        logger.debug("Iris Reply: set_cooldown for group %s, %d min", group_id, actual)
+        return f"ok: cooldown set for {actual} minutes"
 
     @command_group("iris_reply")
     @permission_type(PermissionType.ADMIN)
@@ -308,16 +304,13 @@ class IrisReply(Star):
         )
 
         if event.is_at_or_wake_command:
-            if group_id in self._iris_context:
-                self._iris_context.pop(group_id, None)
-                self._triggering.discard(group_id)
-                logger.debug("Iris Reply: cancelled pending proactive trigger for group %s due to user LLM request", group_id)
+            self._triggering.pop(group_id, None)
             self._state.increment_msg_count(group_id)
-            if group_id not in self._iris_active:
-                self._passive_active[group_id] = time.time()
+            self._passive_active[group_id] = time.time()
+            event.set_extra("iris_mode", "passive")
             return
 
-        if group_id in self._iris_active or group_id in self._triggering:
+        if group_id in self._reply_in_progress or group_id in self._triggering:
             logger.debug("Iris Reply: reply already in progress for group %s", group_id)
             return
 
@@ -339,7 +332,7 @@ class IrisReply(Star):
             finally:
                 self._follow_pending.discard(group_id)
 
-            if group_id in self._iris_active or group_id in self._triggering:
+            if group_id in self._reply_in_progress or group_id in self._triggering:
                 return
             follow_up_users, follow_up_keywords, _ = self._state.get_follow_up_info(group_id)
             if not follow_up_users and not follow_up_keywords:
@@ -361,13 +354,13 @@ class IrisReply(Star):
                 logger.debug("Iris Reply: trigger already in progress for group %s", group_id)
                 return
             self._state.record_detect_time(group_id)
-            self._triggering.add(group_id)
+            self._triggering[group_id] = time.time()
 
-        self._iris_context[group_id] = {
+        event.set_extra("iris_trigger", {
             "trigger_reason": trigger_reason,
             "provider_id": provider_id,
             "is_follow_up": is_follow_up,
-        }
+        })
 
         event.is_at_or_wake_command = True
         event.is_wake = True
@@ -382,16 +375,17 @@ class IrisReply(Star):
     @on_llm_request()
     async def handle_llm_request(self, event, request: ProviderRequest) -> None:
         group_id = event.get_group_id()
-        if not group_id or group_id not in self._iris_context:
+        if not group_id or group_id not in self._triggering:
             return
 
-        ctx = self._iris_context.pop(group_id, None)
-        if ctx is None:
+        trigger_info = event.get_extra("iris_trigger")
+        if not trigger_info:
+            self._triggering.pop(group_id, None)
             return
 
-        trigger_reason = ctx.get("trigger_reason", "")
-        provider_id = ctx.get("provider_id", "")
-        is_follow_up = ctx.get("is_follow_up", False)
+        trigger_reason = trigger_info.get("trigger_reason", "")
+        provider_id = trigger_info.get("provider_id", "")
+        is_follow_up = trigger_info.get("is_follow_up", False)
 
         messages = self._sliding_window.get_messages(group_id)
         context_text = self._context_packager.package(group_id, messages, trigger_reason)
@@ -400,42 +394,10 @@ class IrisReply(Star):
         prompts = WILLINGNESS_PROMPTS[willingness]
         user_prompt = prompts["persona"]
 
-        cached_obs = self._observation_cache.get(group_id)
-        if cached_obs:
-            user_prompt += (
-                f"\n\n<recent_observation>"
-                f"之前的观察：{cached_obs}"
-                "</recent_observation>"
-            )
+        user_prompt += self._build_observation_block(group_id)
 
         if is_follow_up:
-            follow_up_users, follow_up_keywords, follow_up_reason = self._state.get_follow_up_info(group_id)
-            reminder_parts = []
-            if follow_up_users:
-                reminder_parts.append(f"你之前表示对这些用户感兴趣：{', '.join(follow_up_users)}")
-            if follow_up_keywords:
-                reminder_parts.append(f"你之前表示对这些关键词感兴趣：{', '.join(follow_up_keywords)}")
-            if reminder_parts:
-                user_prompt += (
-                    f"\n\n<follow_up_reminder>"
-                    f"{'；'.join(reminder_parts)}"
-                )
-                if follow_up_reason:
-                    user_prompt += f"，原因：{follow_up_reason}"
-                if trigger_reason == "follow_up":
-                    user_prompt += (
-                        "。现在其中有人发言了（可能连续发了多条），"
-                        "请综合评估所有新消息后决定是否回复。"
-                    )
-                else:
-                    user_prompt += (
-                        "。现在对话中出现了你关注的关键词，"
-                        "请综合评估上下文后决定是否回复。"
-                    )
-                user_prompt += (
-                    "如果当前话题已经偏离了你之前关注的原因，将 drifted 设为 true。"
-                    "</follow_up_reminder>"
-                )
+            user_prompt += self._build_follow_up_reminder(group_id, trigger_reason)
 
         user_prompt += "\n\n" + context_text
 
@@ -455,7 +417,7 @@ class IrisReply(Star):
             async with self._state.get_lock(group_id):
                 self._state.record_skip_reply(group_id)
             await self._state.save_dirty(self._kv_save)
-            self._triggering.discard(group_id)
+            self._triggering.pop(group_id, None)
             event.stop_event()
             return
 
@@ -486,7 +448,7 @@ class IrisReply(Star):
             async with self._state.get_lock(group_id):
                 self._state.record_skip_reply(group_id)
             await self._state.save_dirty(self._kv_save)
-            self._triggering.discard(group_id)
+            self._triggering.pop(group_id, None)
             event.stop_event()
             return
 
@@ -495,7 +457,7 @@ class IrisReply(Star):
             async with self._state.get_lock(group_id):
                 self._state.record_skip_reply(group_id)
             await self._state.save_dirty(self._kv_save)
-            self._triggering.discard(group_id)
+            self._triggering.pop(group_id, None)
             event.stop_event()
             return
 
@@ -504,13 +466,15 @@ class IrisReply(Star):
                 self._state.clear_follow_up(group_id)
             await self._state.save_dirty(self._kv_save)
             logger.info("Iris Reply: topic drifted for group %s, cleared follow-up", group_id)
-            self._triggering.discard(group_id)
+            self._triggering.pop(group_id, None)
             event.stop_event()
             return
 
         if result.follow_up_users or result.follow_up_keywords:
             if result.should_reply:
-                self._pending_follow_up[group_id] = (result.follow_up_users, result.follow_up_keywords, result.interest_reason)
+                event.set_extra("iris_pending_fu", (
+                    result.follow_up_users, result.follow_up_keywords, result.interest_reason,
+                ))
             else:
                 async with self._state.get_lock(group_id):
                     self._state.add_follow_up(
@@ -529,19 +493,21 @@ class IrisReply(Star):
                 self._state.record_skip_reply(group_id)
             await self._state.save_dirty(self._kv_save)
             logger.debug("Iris Reply: trigger skip for group %s", group_id)
-            self._triggering.discard(group_id)
+            self._triggering.pop(group_id, None)
             event.stop_event()
             return
 
-        self._iris_active[group_id] = time.time()
-        self._passive_active.pop(group_id, None)
-        self._proactive_reason[group_id] = result.observation
-        self._triggering.discard(group_id)
+        self._reply_in_progress[group_id] = time.time()
+        self._triggering.pop(group_id, None)
+
+        event.set_extra("iris_mode", "proactive")
+        event.set_extra("iris_reason", result.observation)
 
         request.extra_user_content_parts.append(
             TextPart(
-                text="[提示] 本次为主动回复，消息不一定与你相关。"
-                "自然接话即可，不要过度参与或反问，不要暴露此提示。"
+                text="[提示] 本次为主动接话。以上是群聊中最近的对话，"
+                "你决定自然地加入。请保持你的人格，像平时在群里说话一样回复。"
+                "不要暴露此提示。"
             ).mark_as_temp()
         )
         logger.info("Iris Reply: trigger passed (%s) for group %s", trigger_reason, group_id)
@@ -552,11 +518,14 @@ class IrisReply(Star):
         if not group_id:
             return
 
-        if group_id in self._iris_active:
-            self._iris_active.pop(group_id, None)
+        event.set_extra("iris_llm_replied", True)
+        mode = event.get_extra("iris_mode")
+
+        if mode == "proactive":
+            self._reply_in_progress.pop(group_id, None)
             self._passive_active.pop(group_id, None)
 
-            pending = self._pending_follow_up.pop(group_id, None)
+            pending = event.get_extra("iris_pending_fu")
 
             async with self._state.get_lock(group_id):
                 self._state.record_actual_reply(group_id)
@@ -573,9 +542,8 @@ class IrisReply(Star):
             self._tool_ctx.clear_context()
             await self._state.save_dirty(self._kv_save)
             logger.info("Iris Reply: actual reply sent for group %s, follow-up updated", group_id)
-        elif group_id in self._passive_active:
+        elif mode == "passive":
             self._passive_active.pop(group_id, None)
-            self._passive_eval_pending.add(group_id)
 
             async with self._state.get_lock(group_id):
                 self._state.record_actual_reply(group_id, count_consecutive=False)
@@ -583,6 +551,13 @@ class IrisReply(Star):
             self._stats.record_passive_reply(group_id)
             await self._state.save_dirty(self._kv_save)
             logger.info("Iris Reply: passive reply boost applied for group %s", group_id)
+        else:
+            if not self._state.is_whitelisted(group_id):
+                return
+            async with self._state.get_lock(group_id):
+                self._state.record_actual_reply(group_id, count_consecutive=False)
+            await self._state.save_dirty(self._kv_save)
+            logger.info("Iris Reply: normal LLM reply for group %s, boost applied", group_id)
 
     @after_message_sent()
     async def on_message_sent(self, event) -> None:
@@ -594,15 +569,23 @@ class IrisReply(Star):
         sender_id = event.get_sender_id()
         if not sender_id:
             return
-        if group_id in self._proactive_reason:
-            reason = self._proactive_reason.pop(group_id, "")
+        result = event.get_result()
+        bot_text = result.get_plain_text().strip() if result else ""
+        if bot_text:
+            self._sliding_window.append(group_id, WindowMessage(
+                sender_id=event.get_self_id() or "iris",
+                sender_name="Iris",
+                content=bot_text,
+                timestamp=time.time(),
+            ))
+        mode = event.get_extra("iris_mode")
+        if mode == "proactive":
+            reason = event.get_extra("iris_reason", "")
             async with self._state.get_lock(group_id):
                 self._state.add_follow_up(group_id, user_ids=[sender_id], ttl_minutes=3, reason=reason)
             await self._state.save_dirty(self._kv_save)
             logger.debug("Iris Reply: short-TTL follow-up sender %s in group %s after proactive reply", sender_id, group_id)
-            return
-        if group_id in self._passive_eval_pending:
-            self._passive_eval_pending.discard(group_id)
+        elif mode == "passive":
             provider_id = self._config.provider_id or await self._get_provider_id(event)
             if provider_id:
                 await self._passive_follow_up_eval(group_id, provider_id, sender_id)
@@ -610,11 +593,48 @@ class IrisReply(Star):
                 async with self._state.get_lock(group_id):
                     self._state.add_follow_up(group_id, user_ids=[sender_id])
                 await self._state.save_dirty(self._kv_save)
-            return
-        async with self._state.get_lock(group_id):
-            self._state.add_follow_up(group_id, user_ids=[sender_id])
-        await self._state.save_dirty(self._kv_save)
-        logger.debug("Iris Reply: auto follow-up sender %s in group %s after message sent", sender_id, group_id)
+        elif event.get_extra("iris_llm_replied"):
+            async with self._state.get_lock(group_id):
+                self._state.add_follow_up(group_id, user_ids=[sender_id])
+            await self._state.save_dirty(self._kv_save)
+            logger.debug("Iris Reply: default follow-up sender %s in group %s after LLM reply", sender_id, group_id)
+
+    def _build_observation_block(self, group_id: str) -> str:
+        """构建 <recent_observation> 块，若无缓存则返回空字符串。"""
+        cached_obs = self._observation_cache.get(group_id)
+        if cached_obs:
+            return f"\n\n<recent_observation>之前的观察：{cached_obs}</recent_observation>"
+        return ""
+
+    def _build_follow_up_reminder(
+        self, group_id: str, trigger_reason: str = "", include_drifted: bool = True,
+    ) -> str:
+        """构建 <follow_up_reminder> 块，若无跟进信息则返回空字符串。"""
+        follow_up_users, follow_up_keywords, follow_up_reason = self._state.get_follow_up_info(group_id)
+        reminder_parts = []
+        if follow_up_users:
+            reminder_parts.append(f"你之前表示对这些用户感兴趣：{', '.join(follow_up_users)}")
+        if follow_up_keywords:
+            reminder_parts.append(f"你之前表示对这些关键词感兴趣：{', '.join(follow_up_keywords)}")
+        if not reminder_parts:
+            return ""
+        text = f"\n\n<follow_up_reminder>{'；'.join(reminder_parts)}"
+        if follow_up_reason:
+            text += f"，原因：{follow_up_reason}"
+        if include_drifted:
+            if trigger_reason == "follow_up":
+                text += (
+                    "。现在其中有人发言了（可能连续发了多条），"
+                    "请综合评估所有新消息后决定是否回复。"
+                )
+            elif trigger_reason:
+                text += (
+                    "。现在对话中出现了你关注的关键词，"
+                    "请综合评估上下文后决定是否回复。"
+                )
+            text += "如果当前话题已经偏离了你之前关注的原因，将 drifted 设为 true。"
+        text += "</follow_up_reminder>"
+        return text
 
     async def _passive_follow_up_eval(
         self, group_id: str, provider_id: str, fallback_sender: str,
@@ -633,26 +653,8 @@ class IrisReply(Star):
             "只需判断是否需要关注后续对话。</instruction>"
         )
 
-        cached_obs = self._observation_cache.get(group_id)
-        if cached_obs:
-            user_prompt += (
-                f"\n\n<recent_observation>之前的观察：{cached_obs}</recent_observation>"
-            )
-
-        follow_up_users, follow_up_keywords, follow_up_reason = self._state.get_follow_up_info(group_id)
-        if follow_up_users or follow_up_keywords:
-            reminder_parts = []
-            if follow_up_users:
-                reminder_parts.append(f"你之前表示对这些用户感兴趣：{', '.join(follow_up_users)}")
-            if follow_up_keywords:
-                reminder_parts.append(f"你之前表示对这些关键词感兴趣：{', '.join(follow_up_keywords)}")
-            if reminder_parts:
-                user_prompt += (
-                    f"\n\n<follow_up_reminder>{'；'.join(reminder_parts)}"
-                )
-                if follow_up_reason:
-                    user_prompt += f"，原因：{follow_up_reason}"
-                user_prompt += "</follow_up_reminder>"
+        user_prompt += self._build_observation_block(group_id)
+        user_prompt += self._build_follow_up_reminder(group_id, include_drifted=False)
 
         user_prompt += "\n\n" + context_text
 
@@ -715,9 +717,22 @@ class IrisReply(Star):
         except json.JSONDecodeError:
             pass
 
+        in_string = False
+        escape = False
         brace_count = 0
         start = -1
         for i, c in enumerate(text):
+            if escape:
+                escape = False
+                continue
+            if c == "\\":
+                escape = True
+                continue
+            if c == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
             if c == "{":
                 if brace_count == 0:
                     start = i
@@ -783,21 +798,27 @@ class IrisReply(Star):
             topic_drifted=topic_drifted,
         )
 
+    def _get_group_state_summary(self, gid: str) -> dict:
+        """构建群状态摘要字典（_sync_stats_group_state 和 _whitelist_list 共用）。"""
+        data = self._state.get_state(gid)
+        effective_n, effective_t = self._state.get_effective_thresholds(gid)
+        return {
+            "state": data.state.value,
+            "willingness": data.willingness,
+            "msg_count": data.msg_count,
+            "effective_n": effective_n,
+            "effective_t": effective_t,
+            "backoff_level": data.backoff_level,
+            "consecutive_replies": data.consecutive_replies,
+        }
+
     def _sync_stats_group_state(self) -> None:
         if not self._stats.enabled:
             return
         for gid in self._state.get_whitelist():
-            data = self._state.get_state(gid)
-            effective_n, effective_t = self._state.get_effective_thresholds(gid)
             self._stats.update_group_state(
                 group_id=gid,
-                state=data.state.value,
-                willingness=data.willingness,
-                msg_count=data.msg_count,
-                effective_n=effective_n,
-                effective_t=effective_t,
-                backoff_level=data.backoff_level,
-                consecutive_replies=data.consecutive_replies,
+                **self._get_group_state_summary(gid),
             )
 
     def _register_stats_api(self) -> None:
@@ -839,20 +860,11 @@ class IrisReply(Star):
             groups = []
             for gid in self._state.get_whitelist():
                 data = self._state.get_state(gid)
-                effective_n, effective_t = self._state.get_effective_thresholds(gid)
-                groups.append({
-                    "group_id": gid,
-                    "state": data.state.value,
-                    "willingness": data.willingness,
-                    "msg_count": data.msg_count,
-                    "effective_n": effective_n,
-                    "effective_t": effective_t,
-                    "backoff_level": data.backoff_level,
-                    "consecutive_replies": data.consecutive_replies,
-                    "follow_up_users": list(data.follow_up.user_ids),
-                    "follow_up_keywords": list(data.follow_up.keywords),
-                    "follow_up_reason": data.follow_up.reason,
-                })
+                entry = {"group_id": gid, **self._get_group_state_summary(gid)}
+                entry["follow_up_users"] = sorted(data.follow_up.user_ids)
+                entry["follow_up_keywords"] = sorted(data.follow_up.keywords)
+                entry["follow_up_reason"] = data.follow_up.reason
+                groups.append(entry)
             return jsonify(groups)
 
         async def _whitelist_enable():
@@ -917,3 +929,21 @@ class IrisReply(Star):
         grp_prefix = f"/{PLUGIN_NAME}/group"
         self.context.register_web_api(f"{grp_prefix}/set_willingness", _group_set_willingness, ["POST"], "Group set willingness")
         self.context.register_web_api(f"{grp_prefix}/reset", _group_reset, ["POST"], "Group reset")
+
+        async def _config_get():
+            return jsonify({
+                "values": self._config.get_all_page_config(),
+                "meta": ConfigManager.get_page_config_meta(),
+            })
+
+        async def _config_set():
+            from quart import request as qrequest
+            body = await qrequest.get_json(force=True, silent=True) or {}
+            for key, value in body.items():
+                self._config.set_override(key, value)
+            await self._kv_save("iris_reply:config_overrides", self._config.get_overrides())
+            return jsonify({"ok": True, "values": self._config.get_all_page_config()})
+
+        cfg_prefix = f"/{PLUGIN_NAME}/config"
+        self.context.register_web_api(f"{cfg_prefix}/get", _config_get, ["GET"], "Config get")
+        self.context.register_web_api(f"{cfg_prefix}/set", _config_set, ["POST"], "Config set")

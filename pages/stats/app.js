@@ -65,7 +65,8 @@ document.querySelectorAll(".tab").forEach((tab) => {
     document.getElementById(`tab-${name}`).classList.add("active");
     currentTab = name;
     if (name === "manage") renderManage();
-    else renderStats();
+    else if (name === "stats") renderStats();
+    else if (name === "settings") renderSettings();
   });
 });
 
@@ -289,6 +290,7 @@ function renderStatsGroups(groups) {
         <th>触发</th>
         <th>回复</th>
         <th>跳过</th>
+        <th>错误</th>
         <th>偏移</th>
         <th>被动</th>
         <th>消息</th>
@@ -308,6 +310,7 @@ function renderStatsGroups(groups) {
       <td>${g.total_triggers}</td>
       <td>${g.total_replies}</td>
       <td>${g.total_skips}</td>
+      <td>${g.total_errors}</td>
       <td>${g.total_drifts}</td>
       <td>${g.total_passive_replies}</td>
       <td>${g.msg_count}</td>
@@ -390,6 +393,95 @@ async function renderStatsLogs() {
       logPage++; renderStatsLogs();
     });
   }
+}
+
+async function renderSettings() {
+  const container = document.getElementById("tab-settings");
+  container.innerHTML = '<div class="loading">加载中...</div>';
+
+  let data;
+  try {
+    data = await bridge.apiGet("config/get");
+  } catch {
+    container.innerHTML = '<div class="empty">加载配置失败</div>';
+    return;
+  }
+
+  const { values, meta } = data;
+  let html = "";
+
+  const orderedKeys = [
+    "mute_period", "window_size", "default_n", "default_t", "max_token",
+    "quality_threshold", "follow_up_ttl", "follow_up_aggregate_window",
+    "trigger_min_interval", "boost_factor", "boost_duration", "max_boosted_replies",
+  ];
+
+  html += '<div class="config-section">';
+  html += '<h3>基本参数</h3>';
+
+  for (const key of orderedKeys) {
+    const m = meta[key];
+    if (!m) continue;
+    const val = values[key];
+    const hint = m.hint ? `<div class="config-hint">${escapeHtml(m.hint)}</div>` : "";
+
+    if (m.type === "object") {
+      let subItems = "";
+      for (const [subKey, subMeta] of Object.entries(m.items)) {
+        const subVal = val ? val[subKey] : subMeta.min;
+        subItems += `<div class="config-sub-item">
+          <span>${escapeHtml(subMeta.label)}</span>
+          <input type="number" data-config="${key}.${subKey}" value="${subVal}" min="${subMeta.min}" max="${subMeta.max}" />
+        </div>`;
+      }
+      html += `<div class="config-row">
+        <label>${escapeHtml(m.label)}</label>
+        <div class="config-sub-group">${subItems}</div>
+        ${hint}
+      </div>`;
+    } else {
+      const step = m.step || (m.type === "float" ? "0.01" : "1");
+      html += `<div class="config-row">
+        <label>${escapeHtml(m.label)}</label>
+        <input type="number" data-config="${key}" value="${val}" min="${m.min}" max="${m.max}" step="${step}" />
+        ${hint}
+      </div>`;
+    }
+  }
+
+  html += '</div>';
+
+  html += `<div class="config-save-bar">
+    <button class="btn-primary" id="saveConfigBtn">保存配置</button>
+    <span class="config-msg" id="configMsg"></span>
+  </div>`;
+
+  container.innerHTML = html;
+
+  document.getElementById("saveConfigBtn").addEventListener("click", async () => {
+    const msg = document.getElementById("configMsg");
+    msg.className = "config-msg";
+    msg.textContent = "保存中...";
+
+    const payload = {};
+    container.querySelectorAll("[data-config]").forEach((input) => {
+      const path = input.getAttribute("data-config").split(".");
+      if (path.length === 2) {
+        if (!payload[path[0]]) payload[path[0]] = {};
+        payload[path[0]][path[1]] = parseFloat(input.value);
+      } else {
+        payload[path[0]] = parseFloat(input.value);
+      }
+    });
+
+    try {
+      await bridge.apiPost("config/set", payload);
+      msg.textContent = "保存成功";
+    } catch {
+      msg.className = "config-msg error";
+      msg.textContent = "保存失败";
+    }
+  });
 }
 
 renderManage();

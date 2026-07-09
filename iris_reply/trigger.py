@@ -47,20 +47,20 @@ class TriggerEngine:
         message_text = event.message_str or ""
 
         if self.check_follow_up(group_id, sender_id):
-            logger.debug(f"Iris Reply: follow-up trigger for group {group_id}")
+            logger.debug("Iris Reply: follow-up trigger for group %s", group_id)
             self._state.reset_sampling(group_id)
             return "follow_up"
 
         matched_keywords = self.check_keyword(group_id, message_text)
         if matched_keywords:
-            logger.debug(f"Iris Reply: keyword trigger for group {group_id}, keywords={matched_keywords}")
+            logger.debug("Iris Reply: keyword trigger for group %s, keywords=%s", group_id, matched_keywords)
             self._state.reset_sampling(group_id)
             return "keyword_follow_up"
 
         self._state.increment_msg_count(group_id)
 
         if self.check_sampling(group_id):
-            logger.debug(f"Iris Reply: sampling trigger for group {group_id}")
+            logger.debug("Iris Reply: sampling trigger for group %s", group_id)
             self._state.reset_sampling(group_id)
             return "sampling"
 
