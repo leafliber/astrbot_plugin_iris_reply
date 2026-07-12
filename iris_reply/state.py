@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import math
 import time
-from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -44,10 +43,7 @@ class GroupStateData:
     last_sample_time: float = 0.0
     backoff_level: int = 0
     last_backoff_time: float = 0.0
-    auto_adjust_factor: float = 1.0
-    last_auto_adjust_time: float = 0.0
     consecutive_replies: int = 0
-    skip_history: deque = field(default_factory=lambda: deque(maxlen=20))
     follow_up: FollowUpEntry = field(default_factory=FollowUpEntry)
     willingness: str = DEFAULT_LEVEL
     boost_initial: float = 1.0
@@ -63,7 +59,6 @@ class StateManager:
     MAX_FOLLOW_UP_USERS = 20
     MAX_FOLLOW_UP_KEYWORDS = 10
     BACKOFF_DECAY_INTERVAL = 300.0
-    AUTO_ADJUST_DECAY_INTERVAL = 600.0
 
     _GROUP_IDS_KEY = "iris_reply:group_ids"
     _GROUP_KEY_PREFIX = "state:"
@@ -238,25 +233,13 @@ class StateManager:
             data.last_backoff_time = now
             self._mark_dirty(group_id, data)
 
-    def _decay_auto_adjust(self, group_id: str, data: GroupStateData, now: float) -> None:
-        if data.auto_adjust_factor <= 1.0 or data.last_auto_adjust_time <= 0:
-            return
-        elapsed = now - data.last_auto_adjust_time
-        steps = int(elapsed / self.AUTO_ADJUST_DECAY_INTERVAL)
-        if steps > 0:
-            for _ in range(steps):
-                data.auto_adjust_factor = max(1.0, data.auto_adjust_factor / 1.3)
-            data.last_auto_adjust_time = now
-            self._mark_dirty(group_id, data)
-
     def get_effective_thresholds(self, group_id: str) -> tuple[int, int]:
         data = self._ensure_group(group_id)
         now = time.time()
         self._decay_backoff(group_id, data, now)
-        self._decay_auto_adjust(group_id, data, now)
         backoff_factor = BACKOFF_BASE ** data.backoff_level
         boost = self._current_boost(data)
-        combined = data.auto_adjust_factor * backoff_factor * boost
+        combined = backoff_factor * boost
         w_adj = WILLINGNESS_THRESHOLD_ADJUST.get(
             data.willingness, WILLINGNESS_THRESHOLD_ADJUST[DEFAULT_LEVEL]
         )
@@ -294,14 +277,9 @@ class StateManager:
         data = self._ensure_group(group_id)
         if data.backoff_level < MAX_BACKOFF_LEVEL:
             data.backoff_level += 1
-        now = time.time()
         if data.last_backoff_time <= 0:
-            data.last_backoff_time = now
-        if data.last_auto_adjust_time <= 0:
-            data.last_auto_adjust_time = now
+            data.last_backoff_time = time.time()
         data.consecutive_replies = 0
-        data.skip_history.append(now)
-        self._check_auto_adjust(group_id, data)
         self._mark_dirty(group_id, data)
 
     def record_actual_reply(self, group_id: str, *, count_consecutive: bool = True) -> None:
@@ -312,39 +290,19 @@ class StateManager:
             data.consecutive_replies += 1
 
         max_br = self._config.max_boosted_replies
+        now = time.time()
+
         if data.consecutive_replies <= max_br:
-            strength = self._config.boost_factor
-        elif data.consecutive_replies <= max_br * 2:
-            over = data.consecutive_replies - max_br
-            strength = 1.0 - (1.0 - self._config.boost_factor) * max(0.0, 1.0 - over / max_br)
-        else:
-            strength = 1.0
-
-        now = time.time()
-        data.boost_initial = strength
-        data.boost_set_at = now
-        if data.boost_until <= now:
+            data.boost_initial = self._config.boost_factor
+            data.boost_set_at = now
             data.boost_until = now + self._config.boost_duration * 60
+        else:
+            data.boost_initial = 1.0
+            fatigue = min(data.consecutive_replies - max_br, MAX_BACKOFF_LEVEL)
+            data.backoff_level = max(data.backoff_level, fatigue)
+            data.last_backoff_time = now
 
-        if data.auto_adjust_factor > 1.0:
-            data.auto_adjust_factor = max(1.0, data.auto_adjust_factor / 1.5)
-            data.last_auto_adjust_time = now
         self._mark_dirty(group_id, data)
-
-    def _check_auto_adjust(self, group_id: str, data: GroupStateData) -> None:
-        now = time.time()
-        one_hour_ago = now - 3600
-        recent_skips = sum(1 for t in data.skip_history if t >= one_hour_ago)
-        if recent_skips >= 3:
-            new_factor = data.auto_adjust_factor * 1.5
-            w_adj = WILLINGNESS_THRESHOLD_ADJUST.get(
-                data.willingness, WILLINGNESS_THRESHOLD_ADJUST[DEFAULT_LEVEL]
-            )
-            test_n = int(self._config.default_n * new_factor * w_adj["n_factor"])
-            test_t = int(self._config.default_t * new_factor * w_adj["t_factor"])
-            if test_n <= self.N_MAX and test_t <= self.T_MAX:
-                data.auto_adjust_factor = new_factor
-                data.last_auto_adjust_time = now
 
     def can_detect(self, group_id: str, *, follow_up: bool = False) -> bool:
         data = self._ensure_group(group_id)
@@ -374,10 +332,7 @@ class StateManager:
         data.last_sample_time = time.time()
         data.backoff_level = 0
         data.last_backoff_time = 0.0
-        data.auto_adjust_factor = 1.0
-        data.last_auto_adjust_time = 0.0
         data.consecutive_replies = 0
-        data.skip_history.clear()
         data.boost_initial = 1.0
         data.boost_set_at = 0.0
         data.boost_until = 0.0
@@ -520,10 +475,7 @@ class StateManager:
             "last_sample_time": data.last_sample_time,
             "backoff_level": data.backoff_level,
             "last_backoff_time": data.last_backoff_time,
-            "auto_adjust_factor": data.auto_adjust_factor,
-            "last_auto_adjust_time": data.last_auto_adjust_time,
             "consecutive_replies": data.consecutive_replies,
-            "skip_history": list(data.skip_history),
             "follow_up": {
                 "user_ids": list(data.follow_up.user_ids),
                 "user_ttls": data.follow_up.user_ttls,
@@ -559,10 +511,6 @@ class StateManager:
         last_backoff_time = d.get("last_backoff_time", 0.0)
         if backoff_level > 0 and last_backoff_time <= 0:
             last_backoff_time = time.time()
-        auto_adjust_factor = d.get("auto_adjust_factor", 1.0)
-        last_auto_adjust_time = d.get("last_auto_adjust_time", 0.0)
-        if auto_adjust_factor > 1.0 and last_auto_adjust_time <= 0:
-            last_auto_adjust_time = time.time()
         return GroupStateData(
             state=GroupState(d.get("state", "idle")),
             cooldown_until=d.get("cooldown_until", 0.0),
@@ -571,10 +519,7 @@ class StateManager:
             last_sample_time=d.get("last_sample_time", time.time()),
             backoff_level=backoff_level,
             last_backoff_time=last_backoff_time,
-            auto_adjust_factor=auto_adjust_factor,
-            last_auto_adjust_time=last_auto_adjust_time,
             consecutive_replies=d.get("consecutive_replies", 0),
-            skip_history=deque(d.get("skip_history", []), maxlen=20),
             follow_up=follow_up,
             willingness=willingness,
             boost_initial=d.get("boost_initial", 1.0),
@@ -596,7 +541,6 @@ class StateManager:
             f"  回复意愿: {display_level(data.willingness)}",
             f"  消息计数: {data.msg_count}/{effective_n}",
             f"  退避等级: {data.backoff_level} (×{backoff_factor:.2f})",
-            f"  自动调整倍率: {data.auto_adjust_factor:.1f}",
             f"  频率提升: ×{current_boost:.2f}" + (f" (初始×{data.boost_initial:.2f})" if current_boost < 1.0 else ""),
             f"  连续回复: {data.consecutive_replies}",
             f"  有效阈值: N={effective_n}, T={effective_t}分钟",
