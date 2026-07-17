@@ -31,9 +31,7 @@ _DEFAULTS = {
 # Keys managed exclusively through the pages UI (stored in KV overrides).
 # _conf_schema.json only keeps enabled / stats_enabled / provider_id.
 _PAGE_MANAGED_KEYS = {
-    "mute_period", "window_size", "default_n", "default_t", "max_token",
-    "follow_up_ttl", "follow_up_aggregate_window", "quality_threshold",
-    "trigger_min_interval", "boost_factor", "boost_duration", "max_boosted_replies",
+    k for k in _DEFAULTS if k not in {"enabled", "stats_enabled", "provider_id"}
 }
 
 # Metadata for the settings page UI.

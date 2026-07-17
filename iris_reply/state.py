@@ -16,13 +16,13 @@ from .prompts import (
     MAX_BACKOFF_LEVEL,
     VALID_LEVELS,
     WILLINGNESS_THRESHOLD_ADJUST,
+    display_level,
 )
 
 
 class GroupState(Enum):
     IDLE = "idle"
     COOLDOWN = "cooldown"
-    FOLLOWING = "following"
 
 
 @dataclass
@@ -38,7 +38,6 @@ class FollowUpEntry:
 class GroupStateData:
     state: GroupState = GroupState.IDLE
     cooldown_until: float = 0.0
-    following_since: float = 0.0
     msg_count: int = 0
     last_sample_time: float = 0.0
     backoff_level: int = 0
@@ -58,6 +57,7 @@ class StateManager:
     T_MAX = 300
     MAX_FOLLOW_UP_USERS = 20
     MAX_FOLLOW_UP_KEYWORDS = 10
+    MAX_COOLDOWN_MINUTES = 120
     BACKOFF_DECAY_INTERVAL = 300.0
 
     _GROUP_IDS_KEY = "iris_reply:group_ids"
@@ -98,11 +98,8 @@ class StateManager:
         if data.state == GroupState.COOLDOWN and now >= data.cooldown_until:
             data.state = GroupState.IDLE
             self._mark_dirty(group_id, data)
-        if data.state == GroupState.FOLLOWING:
+        if data.follow_up.user_ids or data.follow_up.keywords:
             self._cleanup_expired_follow(group_id, data, now)
-            if not data.follow_up.user_ids and not data.follow_up.keywords:
-                data.state = GroupState.IDLE
-                self._mark_dirty(group_id, data)
         return data
 
     def is_muted(self) -> bool:
@@ -117,7 +114,7 @@ class StateManager:
 
     def set_cooldown(self, group_id: str, minutes: int) -> int:
         data = self._ensure_group(group_id)
-        minutes = max(1, min(self.N_MAX, minutes))
+        minutes = max(1, min(self.MAX_COOLDOWN_MINUTES, minutes))
         data.state = GroupState.COOLDOWN
         data.cooldown_until = time.time() + minutes * 60
         self._mark_dirty(group_id, data)
@@ -134,7 +131,6 @@ class StateManager:
         data = self._ensure_group(group_id)
         now = time.time()
         ttl = (ttl_minutes if ttl_minutes is not None else self._config.follow_up_ttl) * 60
-        was_following = data.state == GroupState.FOLLOWING
         if user_ids:
             for uid in user_ids:
                 if len(data.follow_up.user_ids) >= self.MAX_FOLLOW_UP_USERS:
@@ -149,9 +145,6 @@ class StateManager:
                 data.follow_up.keyword_ttls[kw] = now + ttl
         if reason:
             data.follow_up.reason = reason
-        if not was_following:
-            data.state = GroupState.FOLLOWING
-            data.following_since = now
         self._mark_dirty(group_id, data)
 
     def remove_follow_up(
@@ -169,8 +162,6 @@ class StateManager:
             for kw in keywords:
                 data.follow_up.keywords.discard(kw)
                 data.follow_up.keyword_ttls.pop(kw, None)
-        if not data.follow_up.user_ids and not data.follow_up.keywords:
-            data.state = GroupState.IDLE
         self._mark_dirty(group_id, data)
 
     def _cleanup_expired_follow(self, group_id: str, data: GroupStateData, now: float) -> None:
@@ -323,7 +314,6 @@ class StateManager:
         data.follow_up.keywords.clear()
         data.follow_up.keyword_ttls.clear()
         data.follow_up.reason = ""
-        data.state = GroupState.IDLE
         self._mark_dirty(group_id, data)
 
     def reset_group(self, group_id: str) -> None:
@@ -342,7 +332,6 @@ class StateManager:
         data.follow_up.keywords.clear()
         data.follow_up.keyword_ttls.clear()
         data.follow_up.reason = ""
-        data.following_since = 0.0
         data.state = GroupState.IDLE
         self._mark_dirty(group_id, data)
 
@@ -470,7 +459,6 @@ class StateManager:
         return {
             "state": data.state.value,
             "cooldown_until": data.cooldown_until,
-            "following_since": data.following_since,
             "msg_count": data.msg_count,
             "last_sample_time": data.last_sample_time,
             "backoff_level": data.backoff_level,
@@ -511,10 +499,14 @@ class StateManager:
         last_backoff_time = d.get("last_backoff_time", 0.0)
         if backoff_level > 0 and last_backoff_time <= 0:
             last_backoff_time = time.time()
+        if d.get("state") == GroupState.COOLDOWN.value:
+            state = GroupState.COOLDOWN
+        else:
+            # 历史数据中的 "following"（已移除的状态）及其他未知值一律视为 idle
+            state = GroupState.IDLE
         return GroupStateData(
-            state=GroupState(d.get("state", "idle")),
+            state=state,
             cooldown_until=d.get("cooldown_until", 0.0),
-            following_since=d.get("following_since", 0.0),
             msg_count=d.get("msg_count", 0),
             last_sample_time=d.get("last_sample_time", time.time()),
             backoff_level=backoff_level,
@@ -529,8 +521,6 @@ class StateManager:
         )
 
     def get_status_text(self, group_id: str) -> str:
-        from .prompts import display_level
-
         data = self.get_state(group_id)
         effective_n, effective_t = self.get_effective_thresholds(group_id)
         backoff_factor = BACKOFF_BASE ** data.backoff_level

@@ -59,7 +59,8 @@ class Gatekeeper:
             return 0.2
         if _RE_NONALNUM_ONLY.fullmatch(stripped):
             return 0.1
-        alpha_count = sum(1 for c in stripped if c.isalnum() or "\u4e00" <= c <= "\u9fff")
+        # str.isalnum() 对 CJK 字符同样返回 True，无需额外的区间判断
+        alpha_count = sum(1 for c in stripped if c.isalnum())
         ratio = alpha_count / len(stripped) if stripped else 0
         return min(1.0, ratio)
 

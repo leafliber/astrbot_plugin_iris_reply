@@ -1,10 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import json
-import re
 import time
-from dataclasses import dataclass, field
 from typing import Any
 
 from astrbot.api import logger
@@ -24,7 +21,9 @@ from astrbot.core.agent.message import TextPart
 from astrbot.core.provider.entities import LLMResponse, ProviderRequest
 
 from .iris_reply.admin import AdminCommands
+from .iris_reply.api import register_web_apis, sync_stats_group_state
 from .iris_reply.config import ConfigManager
+from .iris_reply.parser import parse_trigger
 from .iris_reply.perception import ContextPackager, Gatekeeper, SlidingWindow, WindowMessage
 from .iris_reply.prompts import WILLINGNESS_PROMPTS
 from .iris_reply.state import StateManager
@@ -35,17 +34,6 @@ from .iris_reply.trigger import TriggerEngine
 PLUGIN_NAME = "astrbot_plugin_iris_reply"
 
 _IRIS_ACTIVE_TIMEOUT = 120
-
-
-@dataclass
-class TriggerResult:
-    should_reply: bool = False
-    observation: str = ""
-    follow_up_users: list[str] = field(default_factory=list)
-    follow_up_keywords: list[str] = field(default_factory=list)
-    interest_reason: str = ""
-    topic_drifted: bool = False
-    parse_failed: bool = False
 
 
 class IrisReply(Star):
@@ -75,7 +63,15 @@ class IrisReply(Star):
         self._config.load_overrides(config_overrides)
         self._save_task = asyncio.create_task(self._periodic_save())
         self._stats.enabled = self._config.stats_enabled
-        self._register_stats_api()
+        register_web_apis(
+            context=self.context,
+            plugin_name=PLUGIN_NAME,
+            config=self._config,
+            state=self._state,
+            stats=self._stats,
+            window=self._sliding_window,
+            kv_save=self._kv_save,
+        )
         logger.info("Iris Reply: initialized")
 
     async def terminate(self) -> None:
@@ -101,7 +97,7 @@ class IrisReply(Star):
                 await self._kv_save("iris_reply:config_overrides", self._config.get_overrides())
                 self._sliding_window.cleanup(self._state.get_whitelist())
                 self._cleanup_stale_active()
-                self._sync_stats_group_state()
+                sync_stats_group_state(self._state, self._stats)
             except Exception as e:
                 logger.warning("Iris Reply: periodic save error: %s", e)
 
@@ -390,11 +386,7 @@ class IrisReply(Star):
         messages = self._sliding_window.get_messages(group_id)
         context_text = self._context_packager.package(group_id, messages, trigger_reason)
 
-        willingness = self._state.get_willingness(group_id)
-        prompts = WILLINGNESS_PROMPTS[willingness]
-        user_prompt = prompts["persona"]
-
-        user_prompt += self._build_observation_block(group_id)
+        user_prompt, prompts = self._build_trigger_user_prompt(group_id)
 
         if is_follow_up:
             user_prompt += self._build_follow_up_reminder(group_id, trigger_reason)
@@ -423,7 +415,7 @@ class IrisReply(Star):
 
         completion = response.completion_text or ""
         logger.info("Iris Reply: trigger raw response for group %s (len=%d): %.500s", group_id, len(completion), completion)
-        result = self._parse_trigger(completion)
+        result = parse_trigger(completion)
         logger.info(
             "Iris Reply: trigger parsed for group %s: reply=%s, drifted=%s, watch=%s, watch_keywords=%s",
             group_id, result.should_reply, result.topic_drifted, result.follow_up_users, result.follow_up_keywords,
@@ -636,6 +628,19 @@ class IrisReply(Star):
         text += "</follow_up_reminder>"
         return text
 
+    def _build_trigger_user_prompt(self, group_id: str, instruction: str = "") -> tuple[str, dict]:
+        """组装触发评估 user prompt 的基础部分（persona + 可选指令 + 观察块）。
+
+        返回 (user_prompt, prompts)，调用方按需追加 follow-up 提醒与上下文文本。
+        """
+        willingness = self._state.get_willingness(group_id)
+        prompts = WILLINGNESS_PROMPTS[willingness]
+        user_prompt = prompts["persona"]
+        if instruction:
+            user_prompt += f"\n\n<instruction>{instruction}</instruction>"
+        user_prompt += self._build_observation_block(group_id)
+        return user_prompt, prompts
+
     async def _passive_follow_up_eval(
         self, group_id: str, provider_id: str, fallback_sender: str,
     ) -> None:
@@ -645,15 +650,12 @@ class IrisReply(Star):
 
         context_text = self._context_packager.package(group_id, messages, "passive")
 
-        willingness = self._state.get_willingness(group_id)
-        prompts = WILLINGNESS_PROMPTS[willingness]
-        user_prompt = (
-            prompts["persona"]
-            + "\n\n<instruction>本次为被动回复后的跟进评估，你必须将 reply 设为 false，"
-            "只需判断是否需要关注后续对话。</instruction>"
+        user_prompt, prompts = self._build_trigger_user_prompt(
+            group_id,
+            instruction="本次为被动回复后的跟进评估，你必须将 reply 设为 false，"
+            "只需判断是否需要关注后续对话。",
         )
 
-        user_prompt += self._build_observation_block(group_id)
         user_prompt += self._build_follow_up_reminder(group_id, include_drifted=False)
 
         user_prompt += "\n\n" + context_text
@@ -671,7 +673,7 @@ class IrisReply(Star):
             await self._state.save_dirty(self._kv_save)
             return
 
-        result = self._parse_trigger(response.completion_text or "")
+        result = parse_trigger(response.completion_text or "")
         logger.info(
             "Iris Reply: passive eval for group %s: watch=%s, keywords=%s, drifted=%s",
             group_id, result.follow_up_users, result.follow_up_keywords, result.topic_drifted,
@@ -700,250 +702,3 @@ class IrisReply(Star):
             async with self._state.get_lock(group_id):
                 self._state.add_follow_up(group_id, user_ids=[fallback_sender])
             await self._state.save_dirty(self._kv_save)
-
-    @staticmethod
-    def _extract_json(text: str) -> dict | None:
-        match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
-        if match:
-            text = match.group(1).strip()
-
-        text = re.sub(r'"\s*:\s*True', '": true', text)
-        text = re.sub(r'"\s*:\s*False', '": false', text)
-
-        try:
-            obj = json.loads(text)
-            if isinstance(obj, dict):
-                return obj
-        except json.JSONDecodeError:
-            pass
-
-        in_string = False
-        escape = False
-        brace_count = 0
-        start = -1
-        for i, c in enumerate(text):
-            if escape:
-                escape = False
-                continue
-            if c == "\\":
-                escape = True
-                continue
-            if c == '"':
-                in_string = not in_string
-                continue
-            if in_string:
-                continue
-            if c == "{":
-                if brace_count == 0:
-                    start = i
-                brace_count += 1
-            elif c == "}":
-                brace_count -= 1
-                if brace_count == 0 and start >= 0:
-                    try:
-                        obj = json.loads(text[start : i + 1])
-                        if isinstance(obj, dict):
-                            return obj
-                    except json.JSONDecodeError:
-                        start = -1
-
-        return None
-
-    @staticmethod
-    def _parse_bool(val: Any) -> bool:
-        if isinstance(val, str):
-            return val.lower() in ("true", "yes", "1")
-        if isinstance(val, (int, float)):
-            return bool(val)
-        return bool(val)
-
-    @staticmethod
-    def _parse_string_list(raw: Any, max_len: int = 10) -> list[str]:
-        if not isinstance(raw, list):
-            return []
-        result = [str(u).strip() for u in raw if str(u).strip()]
-        return result[:max_len]
-
-    @classmethod
-    def _parse_trigger(cls, text: str) -> TriggerResult:
-        obj = cls._extract_json(text)
-        if not obj:
-            logger.warning("Iris Reply: trigger JSON parse failed, raw text: %.300s", text)
-            return TriggerResult(parse_failed=True)
-
-        should_reply = cls._parse_bool(
-            obj.get("reply", obj.get("should_reply", False))
-        )
-        topic_drifted = cls._parse_bool(
-            obj.get("drifted", obj.get("topic_drifted", False))
-        )
-        follow_up_users = cls._parse_string_list(
-            obj.get("watch", obj.get("follow_up_users", []))
-        )
-        follow_up_keywords = cls._parse_string_list(
-            obj.get("watch_keywords", obj.get("follow_up_keywords", [])),
-            max_len=10,
-        )
-        interest_reason = str(
-            obj.get("why", obj.get("interest_reason", ""))
-        )
-        observation = str(obj.get("obs", obj.get("observation", "")))
-
-        return TriggerResult(
-            should_reply=should_reply,
-            observation=observation,
-            follow_up_users=follow_up_users,
-            follow_up_keywords=follow_up_keywords,
-            interest_reason=interest_reason,
-            topic_drifted=topic_drifted,
-        )
-
-    def _get_group_state_summary(self, gid: str) -> dict:
-        """构建群状态摘要字典（_sync_stats_group_state 和 _whitelist_list 共用）。"""
-        data = self._state.get_state(gid)
-        effective_n, effective_t = self._state.get_effective_thresholds(gid)
-        return {
-            "state": data.state.value,
-            "willingness": data.willingness,
-            "msg_count": data.msg_count,
-            "effective_n": effective_n,
-            "effective_t": effective_t,
-            "backoff_level": data.backoff_level,
-            "consecutive_replies": data.consecutive_replies,
-        }
-
-    def _sync_stats_group_state(self) -> None:
-        if not self._stats.enabled:
-            return
-        for gid in self._state.get_whitelist():
-            self._stats.update_group_state(
-                group_id=gid,
-                **self._get_group_state_summary(gid),
-            )
-
-    def _register_stats_api(self) -> None:
-        from quart import jsonify
-
-        async def _stats_status():
-            return jsonify({"enabled": self._stats.enabled})
-
-        async def _stats_groups():
-            return jsonify(self._stats.get_group_summaries())
-
-        async def _stats_logs():
-            from quart import request as qrequest
-            group_id = qrequest.args.get("group_id", "")
-            try:
-                limit = int(qrequest.args.get("limit", "50"))
-                offset = int(qrequest.args.get("offset", "0"))
-            except (ValueError, TypeError):
-                limit, offset = 50, 0
-            limit = max(1, min(200, limit))
-            offset = max(0, offset)
-            return jsonify(self._stats.get_llm_logs(
-                group_id=group_id or None,
-                limit=limit,
-                offset=offset,
-            ))
-
-        async def _stats_group_detail(group_id: str):
-            detail = self._stats.get_group_detail(group_id)
-            if detail is None:
-                return jsonify({"error": "not found"}), 404
-            return jsonify(detail)
-
-        async def _stats_clear():
-            self._stats.clear_logs()
-            return jsonify({"ok": True})
-
-        async def _whitelist_list():
-            groups = []
-            for gid in self._state.get_whitelist():
-                data = self._state.get_state(gid)
-                entry = {"group_id": gid, **self._get_group_state_summary(gid)}
-                entry["follow_up_users"] = sorted(data.follow_up.user_ids)
-                entry["follow_up_keywords"] = sorted(data.follow_up.keywords)
-                entry["follow_up_reason"] = data.follow_up.reason
-                groups.append(entry)
-            return jsonify(groups)
-
-        async def _whitelist_enable():
-            from quart import request as qrequest
-            body = await qrequest.get_json(force=True, silent=True) or {}
-            group_id = body.get("group_id", "")
-            if not group_id:
-                return jsonify({"error": "group_id required"}), 400
-            self._state.add_to_whitelist(str(group_id))
-            await self._state.save_dirty(self._kv_save)
-            return jsonify({"ok": True, "group_id": group_id})
-
-        async def _whitelist_disable():
-            from quart import request as qrequest
-            body = await qrequest.get_json(force=True, silent=True) or {}
-            group_id = body.get("group_id", "")
-            if not group_id:
-                return jsonify({"error": "group_id required"}), 400
-            self._state.remove_from_whitelist(str(group_id))
-            self._sliding_window.remove_group(str(group_id))
-            self._state.remove_group_lock(str(group_id))
-            await self._state.save_dirty(self._kv_save)
-            return jsonify({"ok": True, "group_id": group_id})
-
-        async def _group_set_willingness():
-            from quart import request as qrequest
-            body = await qrequest.get_json(force=True, silent=True) or {}
-            group_id = body.get("group_id", "")
-            level = body.get("willingness", "")
-            if not group_id or not level:
-                return jsonify({"error": "group_id and willingness required"}), 400
-            from .iris_reply.prompts import resolve_level
-            resolved = resolve_level(level)
-            if not resolved:
-                return jsonify({"error": "invalid willingness level"}), 400
-            self._state.set_willingness(str(group_id), resolved)
-            await self._state.save_dirty(self._kv_save)
-            return jsonify({"ok": True, "group_id": group_id, "willingness": resolved})
-
-        async def _group_reset():
-            from quart import request as qrequest
-            body = await qrequest.get_json(force=True, silent=True) or {}
-            group_id = body.get("group_id", "")
-            if not group_id:
-                return jsonify({"error": "group_id required"}), 400
-            self._state.reset_group(str(group_id))
-            await self._state.save_dirty(self._kv_save)
-            return jsonify({"ok": True, "group_id": group_id})
-
-        prefix = f"/{PLUGIN_NAME}/stats"
-        self.context.register_web_api(f"{prefix}/status", _stats_status, ["GET"], "Stats status")
-        self.context.register_web_api(f"{prefix}/groups", _stats_groups, ["GET"], "Stats groups")
-        self.context.register_web_api(f"{prefix}/logs", _stats_logs, ["GET"], "Stats logs")
-        self.context.register_web_api(f"{prefix}/group/<group_id>", _stats_group_detail, ["GET"], "Stats group detail")
-        self.context.register_web_api(f"{prefix}/clear", _stats_clear, ["POST"], "Stats clear")
-
-        wl_prefix = f"/{PLUGIN_NAME}/whitelist"
-        self.context.register_web_api(f"{wl_prefix}/list", _whitelist_list, ["GET"], "Whitelist list")
-        self.context.register_web_api(f"{wl_prefix}/enable", _whitelist_enable, ["POST"], "Whitelist enable")
-        self.context.register_web_api(f"{wl_prefix}/disable", _whitelist_disable, ["POST"], "Whitelist disable")
-
-        grp_prefix = f"/{PLUGIN_NAME}/group"
-        self.context.register_web_api(f"{grp_prefix}/set_willingness", _group_set_willingness, ["POST"], "Group set willingness")
-        self.context.register_web_api(f"{grp_prefix}/reset", _group_reset, ["POST"], "Group reset")
-
-        async def _config_get():
-            return jsonify({
-                "values": self._config.get_all_page_config(),
-                "meta": ConfigManager.get_page_config_meta(),
-            })
-
-        async def _config_set():
-            from quart import request as qrequest
-            body = await qrequest.get_json(force=True, silent=True) or {}
-            for key, value in body.items():
-                self._config.set_override(key, value)
-            await self._kv_save("iris_reply:config_overrides", self._config.get_overrides())
-            return jsonify({"ok": True, "values": self._config.get_all_page_config()})
-
-        cfg_prefix = f"/{PLUGIN_NAME}/config"
-        self.context.register_web_api(f"{cfg_prefix}/get", _config_get, ["GET"], "Config get")
-        self.context.register_web_api(f"{cfg_prefix}/set", _config_set, ["POST"], "Config set")
