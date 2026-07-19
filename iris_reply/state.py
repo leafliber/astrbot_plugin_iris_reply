@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import math
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -26,12 +25,42 @@ class GroupState(Enum):
 
 
 @dataclass
-class FollowUpEntry:
-    user_ids: set[str] = field(default_factory=set)
-    user_ttls: dict[str, float] = field(default_factory=dict)
+class ThreadAnchor:
+    """统一对话锚点：记录"我上次以什么动机说了什么、在关注谁/什么"。
+
+    三种发言模式（chime_in / follow_up / initiate）以及被动回复共用同一锚点结构。
+    participants / keywords 带 TTL，过期后不再触发跟进匹配；
+    topic / bot_message / reason 随锚点保留，用于决策 prompt 中的身份与话题连续性。
+    """
+
+    kind: str = ""  # "chime_in" | "follow_up" | "initiate" | "passive" | "reply"
+    topic: str = ""
+    bot_message: str = ""
+    participants: set[str] = field(default_factory=set)
+    participant_ttls: dict[str, float] = field(default_factory=dict)
     keywords: set[str] = field(default_factory=set)
     keyword_ttls: dict[str, float] = field(default_factory=dict)
     reason: str = ""
+    created_at: float = 0.0
+
+    @property
+    def active(self) -> bool:
+        return bool(self.participants or self.keywords)
+
+    @property
+    def has_context(self) -> bool:
+        return bool(self.bot_message or self.participants or self.keywords)
+
+    def clear(self) -> None:
+        self.kind = ""
+        self.topic = ""
+        self.bot_message = ""
+        self.participants.clear()
+        self.participant_ttls.clear()
+        self.keywords.clear()
+        self.keyword_ttls.clear()
+        self.reason = ""
+        self.created_at = 0.0
 
 
 @dataclass
@@ -43,26 +72,32 @@ class GroupStateData:
     backoff_level: int = 0
     last_backoff_time: float = 0.0
     consecutive_replies: int = 0
-    follow_up: FollowUpEntry = field(default_factory=FollowUpEntry)
     willingness: str = DEFAULT_LEVEL
     boost_initial: float = 1.0
     boost_set_at: float = 0.0
     boost_until: float = 0.0
     last_detect_time: float = 0.0
+    anchor: ThreadAnchor = field(default_factory=ThreadAnchor)
+    last_observation: str = ""
+    last_drift_time: float = 0.0
+    last_initiate_time: float = 0.0
+    initiate_daily_count: int = 0
+    initiate_count_date: str = ""
+    initiate_pending_since: float = 0.0
+    initiate_no_reply_streak: int = 0
     dirty: bool = False
 
 
 class StateManager:
     N_MAX = 120
     T_MAX = 300
-    MAX_FOLLOW_UP_USERS = 20
-    MAX_FOLLOW_UP_KEYWORDS = 10
+    MAX_ANCHOR_USERS = 20
+    MAX_ANCHOR_KEYWORDS = 10
     MAX_COOLDOWN_MINUTES = 120
     BACKOFF_DECAY_INTERVAL = 300.0
 
     _GROUP_IDS_KEY = "iris_reply:group_ids"
     _GROUP_KEY_PREFIX = "state:"
-    _LEGACY_BULK_KEY = "iris_reply:all_groups"
 
     def __init__(self, config: ConfigManager) -> None:
         self._config = config
@@ -92,14 +127,24 @@ class StateManager:
             self._group_ids_dirty = True
         return self._groups[group_id]
 
+    @staticmethod
+    def _today() -> str:
+        return time.strftime("%Y-%m-%d", time.localtime())
+
     def get_state(self, group_id: str) -> GroupStateData:
         data = self._ensure_group(group_id)
         now = time.time()
         if data.state == GroupState.COOLDOWN and now >= data.cooldown_until:
             data.state = GroupState.IDLE
             self._mark_dirty(group_id, data)
-        if data.follow_up.user_ids or data.follow_up.keywords:
-            self._cleanup_expired_follow(group_id, data, now)
+        if data.anchor.participants or data.anchor.keywords:
+            self._cleanup_expired_anchor(group_id, data, now)
+        today = self._today()
+        if data.initiate_count_date != today:
+            data.initiate_count_date = today
+            data.initiate_daily_count = 0
+            data.initiate_no_reply_streak = 0
+            self._mark_dirty(group_id, data)
         return data
 
     def is_muted(self) -> bool:
@@ -120,82 +165,197 @@ class StateManager:
         self._mark_dirty(group_id, data)
         return minutes
 
-    def add_follow_up(
+    # ---- 对话锚点 ----
+
+    def write_anchor(
         self,
         group_id: str,
-        user_ids: list[str] | None = None,
+        *,
+        kind: str,
+        topic: str = "",
+        bot_message: str = "",
+        users: list[str] | None = None,
         keywords: list[str] | None = None,
         reason: str = "",
         ttl_minutes: float | None = None,
     ) -> None:
+        """发言后整体写入新锚点（替换旧锚点）。"""
         data = self._ensure_group(group_id)
-        now = time.time()
-        ttl = (ttl_minutes if ttl_minutes is not None else self._config.follow_up_ttl) * 60
-        if user_ids:
-            for uid in user_ids:
-                if len(data.follow_up.user_ids) >= self.MAX_FOLLOW_UP_USERS:
-                    break
-                data.follow_up.user_ids.add(uid)
-                data.follow_up.user_ttls[uid] = now + ttl
-        if keywords:
-            for kw in keywords:
-                if len(data.follow_up.keywords) >= self.MAX_FOLLOW_UP_KEYWORDS:
-                    break
-                data.follow_up.keywords.add(kw)
-                data.follow_up.keyword_ttls[kw] = now + ttl
-        if reason:
-            data.follow_up.reason = reason
+        anchor = ThreadAnchor(
+            kind=kind,
+            topic=topic,
+            bot_message=bot_message,
+            reason=reason,
+            created_at=time.time(),
+        )
+        data.anchor = anchor
+        self._fill_anchor_watch(group_id, data, users, keywords, ttl_minutes)
         self._mark_dirty(group_id, data)
 
-    def remove_follow_up(
+    def add_anchor_watch(
+        self,
+        group_id: str,
+        users: list[str] | None = None,
+        keywords: list[str] | None = None,
+        reason: str = "",
+        ttl_minutes: float | None = None,
+    ) -> None:
+        """不发言时向现有锚点合并关注对象。"""
+        data = self._ensure_group(group_id)
+        if not data.anchor.created_at:
+            data.anchor.created_at = time.time()
+        self._fill_anchor_watch(group_id, data, users, keywords, ttl_minutes)
+        if reason:
+            data.anchor.reason = reason
+        self._mark_dirty(group_id, data)
+
+    def _fill_anchor_watch(
+        self,
+        group_id: str,
+        data: GroupStateData,
+        users: list[str] | None,
+        keywords: list[str] | None,
+        ttl_minutes: float | None,
+    ) -> None:
+        now = time.time()
+        ttl = (ttl_minutes if ttl_minutes is not None else self._config.follow_up_ttl) * 60
+        anchor = data.anchor
+        if users:
+            for uid in users:
+                if uid in anchor.participants or len(anchor.participants) < self.MAX_ANCHOR_USERS:
+                    anchor.participants.add(uid)
+                    anchor.participant_ttls[uid] = now + ttl
+        if keywords:
+            for kw in keywords:
+                if kw in anchor.keywords or len(anchor.keywords) < self.MAX_ANCHOR_KEYWORDS:
+                    anchor.keywords.add(kw)
+                    anchor.keyword_ttls[kw] = now + ttl
+
+    def remove_anchor_watch(
         self,
         group_id: str,
         user_ids: list[str] | None = None,
         keywords: list[str] | None = None,
     ) -> None:
         data = self._ensure_group(group_id)
+        anchor = data.anchor
         if user_ids:
             for uid in user_ids:
-                data.follow_up.user_ids.discard(uid)
-                data.follow_up.user_ttls.pop(uid, None)
+                anchor.participants.discard(uid)
+                anchor.participant_ttls.pop(uid, None)
         if keywords:
             for kw in keywords:
-                data.follow_up.keywords.discard(kw)
-                data.follow_up.keyword_ttls.pop(kw, None)
+                anchor.keywords.discard(kw)
+                anchor.keyword_ttls.pop(kw, None)
+        if not user_ids and not keywords:
+            anchor.clear()
         self._mark_dirty(group_id, data)
 
-    def _cleanup_expired_follow(self, group_id: str, data: GroupStateData, now: float) -> None:
-        expired_users = [uid for uid, ttl in data.follow_up.user_ttls.items() if now >= ttl]
+    def close_anchor(self, group_id: str) -> None:
+        data = self._ensure_group(group_id)
+        data.anchor.clear()
+        self._mark_dirty(group_id, data)
+
+    def _cleanup_expired_anchor(self, group_id: str, data: GroupStateData, now: float) -> None:
+        anchor = data.anchor
+        expired_users = [uid for uid, ttl in anchor.participant_ttls.items() if now >= ttl]
         for uid in expired_users:
-            data.follow_up.user_ids.discard(uid)
-            data.follow_up.user_ttls.pop(uid, None)
-        expired_keywords = [kw for kw, ttl in data.follow_up.keyword_ttls.items() if now >= ttl]
+            anchor.participants.discard(uid)
+            anchor.participant_ttls.pop(uid, None)
+        expired_keywords = [kw for kw, ttl in anchor.keyword_ttls.items() if now >= ttl]
         for kw in expired_keywords:
-            data.follow_up.keywords.discard(kw)
-            data.follow_up.keyword_ttls.pop(kw, None)
+            anchor.keywords.discard(kw)
+            anchor.keyword_ttls.pop(kw, None)
         if expired_users or expired_keywords:
             self._mark_dirty(group_id, data)
 
-    def match_follow_up(self, group_id: str, sender_id: str) -> bool:
+    def match_anchor_user(self, group_id: str, sender_id: str) -> bool:
         data = self.get_state(group_id)
         if data.state == GroupState.COOLDOWN:
             return False
-        return sender_id in data.follow_up.user_ids
+        return sender_id in data.anchor.participants
 
-    def match_keyword(self, group_id: str, text: str) -> list[str]:
+    def match_anchor_keyword(self, group_id: str, text: str) -> list[str]:
         data = self.get_state(group_id)
         if data.state == GroupState.COOLDOWN:
             return []
         matched = []
         text_lower = text.lower()
-        for kw in data.follow_up.keywords:
+        for kw in data.anchor.keywords:
             if kw.lower() in text_lower:
                 matched.append(kw)
         return matched
 
-    def get_follow_up_info(self, group_id: str) -> tuple[list[str], list[str], str]:
+    def get_anchor(self, group_id: str) -> ThreadAnchor:
+        return self.get_state(group_id).anchor
+
+    def set_observation(self, group_id: str, observation: str) -> None:
+        if not observation:
+            return
+        data = self._ensure_group(group_id)
+        data.last_observation = observation
+        self._mark_dirty(group_id, data)
+
+    def get_observation(self, group_id: str) -> str:
+        return self._ensure_group(group_id).last_observation
+
+    def record_drift(self, group_id: str) -> None:
+        data = self._ensure_group(group_id)
+        data.last_drift_time = time.time()
+        self._mark_dirty(group_id, data)
+
+    # ---- 主动发起 ----
+
+    def is_initiate_pending(self, group_id: str) -> bool:
+        return self._ensure_group(group_id).initiate_pending_since > 0
+
+    def consume_initiate_pending(self, group_id: str) -> bool:
+        """群友在发起后发言（接话）：清除 pending 并重置无人接话计数。"""
+        data = self._ensure_group(group_id)
+        if data.initiate_pending_since <= 0:
+            return False
+        data.initiate_pending_since = 0.0
+        data.initiate_no_reply_streak = 0
+        self._mark_dirty(group_id, data)
+        return True
+
+    def record_initiate(
+        self,
+        group_id: str,
+        *,
+        topic: str = "",
+        bot_message: str = "",
+        users: list[str] | None = None,
+        keywords: list[str] | None = None,
+        reason: str = "",
+    ) -> None:
+        """主动发起成功后记账：次数、时间、接话 pending，并写入发起锚点。"""
+        data = self.get_state(group_id)  # get_state 处理跨天重置
+        now = time.time()
+        data.initiate_daily_count += 1
+        data.last_initiate_time = now
+        data.initiate_pending_since = now
+        self.write_anchor(
+            group_id,
+            kind="initiate",
+            topic=topic,
+            bot_message=bot_message,
+            users=users,
+            keywords=keywords,
+            reason=reason,
+        )
+        self._mark_dirty(group_id, data)
+
+    def record_initiate_unanswered(self, group_id: str) -> None:
+        """发起后超时无人接话：清除 pending 并累计 streak。"""
         data = self.get_state(group_id)
-        return sorted(data.follow_up.user_ids), sorted(data.follow_up.keywords), data.follow_up.reason
+        if data.initiate_pending_since <= 0:
+            return
+        data.initiate_pending_since = 0.0
+        data.initiate_no_reply_streak += 1
+        self._mark_dirty(group_id, data)
+
+    # ---- 采样与自适应阈值 ----
 
     def increment_msg_count(self, group_id: str) -> int:
         data = self._ensure_group(group_id)
@@ -307,15 +467,6 @@ class StateManager:
         data = self._ensure_group(group_id)
         data.last_detect_time = time.time()
 
-    def clear_follow_up(self, group_id: str) -> None:
-        data = self._ensure_group(group_id)
-        data.follow_up.user_ids.clear()
-        data.follow_up.user_ttls.clear()
-        data.follow_up.keywords.clear()
-        data.follow_up.keyword_ttls.clear()
-        data.follow_up.reason = ""
-        self._mark_dirty(group_id, data)
-
     def reset_group(self, group_id: str) -> None:
         data = self._ensure_group(group_id)
         data.msg_count = 0
@@ -327,13 +478,18 @@ class StateManager:
         data.boost_set_at = 0.0
         data.boost_until = 0.0
         data.last_detect_time = 0.0
-        data.follow_up.user_ids.clear()
-        data.follow_up.user_ttls.clear()
-        data.follow_up.keywords.clear()
-        data.follow_up.keyword_ttls.clear()
-        data.follow_up.reason = ""
+        data.anchor.clear()
+        data.last_observation = ""
+        data.last_drift_time = 0.0
+        data.last_initiate_time = 0.0
+        data.initiate_daily_count = 0
+        data.initiate_count_date = self._today()
+        data.initiate_pending_since = 0.0
+        data.initiate_no_reply_streak = 0
         data.state = GroupState.IDLE
         self._mark_dirty(group_id, data)
+
+    # ---- 持久化 ----
 
     async def save_dirty(self, save_fn) -> None:
         async with self._global_lock:
@@ -404,7 +560,6 @@ class StateManager:
         except Exception as e:
             logger.warning("Iris Reply: whitelist KV load failed: %s", e)
 
-        loaded_any = False
         try:
             group_ids = await load_fn(self._GROUP_IDS_KEY)
             if group_ids and isinstance(group_ids, list):
@@ -412,19 +567,8 @@ class StateManager:
                     gdata = await load_fn(f"{self._GROUP_KEY_PREFIX}{str(gid)}")
                     if gdata and isinstance(gdata, dict):
                         self._groups[str(gid)] = self._deserialize_group(gdata)
-                        loaded_any = True
         except Exception as e:
-            logger.warning("Iris Reply: per-group KV load failed: %s", e)
-
-        if not loaded_any:
-            try:
-                all_data = await load_fn(self._LEGACY_BULK_KEY)
-                if all_data and isinstance(all_data, dict):
-                    for gid, gdata in all_data.items():
-                        self._groups[str(gid)] = self._deserialize_group(gdata)
-                    logger.info("Iris Reply: loaded %d groups from legacy bulk format", len(all_data))
-            except Exception as e:
-                logger.warning("Iris Reply: KV load failed, running in memory-only mode: %s", e)
+            logger.warning("Iris Reply: per-group KV load failed, running in memory-only mode: %s", e)
 
     async def save_all(self, save_fn) -> None:
         async with self._global_lock:
@@ -456,6 +600,7 @@ class StateManager:
                 logger.warning("Iris Reply: group manifest KV save failed: %s", e)
 
     def _serialize_group(self, data: GroupStateData) -> dict[str, Any]:
+        anchor = data.anchor
         return {
             "state": data.state.value,
             "cooldown_until": data.cooldown_until,
@@ -464,46 +609,54 @@ class StateManager:
             "backoff_level": data.backoff_level,
             "last_backoff_time": data.last_backoff_time,
             "consecutive_replies": data.consecutive_replies,
-            "follow_up": {
-                "user_ids": list(data.follow_up.user_ids),
-                "user_ttls": data.follow_up.user_ttls,
-                "keywords": list(data.follow_up.keywords),
-                "keyword_ttls": data.follow_up.keyword_ttls,
-                "reason": data.follow_up.reason,
-            },
             "willingness": data.willingness,
             "boost_initial": data.boost_initial,
             "boost_set_at": data.boost_set_at,
             "boost_until": data.boost_until,
             "last_detect_time": data.last_detect_time,
+            "anchor": {
+                "kind": anchor.kind,
+                "topic": anchor.topic,
+                "bot_message": anchor.bot_message,
+                "participants": list(anchor.participants),
+                "participant_ttls": anchor.participant_ttls,
+                "keywords": list(anchor.keywords),
+                "keyword_ttls": anchor.keyword_ttls,
+                "reason": anchor.reason,
+                "created_at": anchor.created_at,
+            },
+            "last_observation": data.last_observation,
+            "last_drift_time": data.last_drift_time,
+            "last_initiate_time": data.last_initiate_time,
+            "initiate_daily_count": data.initiate_daily_count,
+            "initiate_count_date": data.initiate_count_date,
+            "initiate_pending_since": data.initiate_pending_since,
+            "initiate_no_reply_streak": data.initiate_no_reply_streak,
         }
 
     def _deserialize_group(self, d: dict[str, Any]) -> GroupStateData:
-        follow_up = FollowUpEntry(
-            user_ids=set(d.get("follow_up", {}).get("user_ids", [])),
-            user_ttls=d.get("follow_up", {}).get("user_ttls", {}),
-            keywords=set(d.get("follow_up", {}).get("keywords", [])),
-            keyword_ttls=d.get("follow_up", {}).get("keyword_ttls", {}),
-            reason=d.get("follow_up", {}).get("reason", ""),
+        a = d.get("anchor", {})
+        anchor = ThreadAnchor(
+            kind=a.get("kind", ""),
+            topic=a.get("topic", ""),
+            bot_message=a.get("bot_message", ""),
+            participants=set(a.get("participants", [])),
+            participant_ttls=a.get("participant_ttls", {}),
+            keywords=set(a.get("keywords", [])),
+            keyword_ttls=a.get("keyword_ttls", {}),
+            reason=a.get("reason", ""),
+            created_at=a.get("created_at", 0.0),
         )
         willingness = d.get("willingness", DEFAULT_LEVEL)
         if willingness not in VALID_LEVELS:
             willingness = DEFAULT_LEVEL
-        if "backoff_level" in d:
-            backoff_level = min(d["backoff_level"], MAX_BACKOFF_LEVEL)
-        elif "backoff_multiplier" in d:
-            old_mult = max(d["backoff_multiplier"], 1)
-            backoff_level = min(int(math.log2(old_mult)), MAX_BACKOFF_LEVEL)
-        else:
-            backoff_level = 0
+        backoff_level = min(d.get("backoff_level", 0), MAX_BACKOFF_LEVEL)
         last_backoff_time = d.get("last_backoff_time", 0.0)
         if backoff_level > 0 and last_backoff_time <= 0:
             last_backoff_time = time.time()
+        state = GroupState.IDLE
         if d.get("state") == GroupState.COOLDOWN.value:
             state = GroupState.COOLDOWN
-        else:
-            # 历史数据中的 "following"（已移除的状态）及其他未知值一律视为 idle
-            state = GroupState.IDLE
         return GroupStateData(
             state=state,
             cooldown_until=d.get("cooldown_until", 0.0),
@@ -512,12 +665,19 @@ class StateManager:
             backoff_level=backoff_level,
             last_backoff_time=last_backoff_time,
             consecutive_replies=d.get("consecutive_replies", 0),
-            follow_up=follow_up,
             willingness=willingness,
             boost_initial=d.get("boost_initial", 1.0),
             boost_set_at=d.get("boost_set_at", 0.0),
             boost_until=d.get("boost_until", 0.0),
             last_detect_time=d.get("last_detect_time", 0.0),
+            anchor=anchor,
+            last_observation=d.get("last_observation", ""),
+            last_drift_time=d.get("last_drift_time", 0.0),
+            last_initiate_time=d.get("last_initiate_time", 0.0),
+            initiate_daily_count=d.get("initiate_daily_count", 0),
+            initiate_count_date=d.get("initiate_count_date", ""),
+            initiate_pending_since=d.get("initiate_pending_since", 0.0),
+            initiate_no_reply_streak=d.get("initiate_no_reply_streak", 0),
         )
 
     def get_status_text(self, group_id: str) -> str:
@@ -541,10 +701,22 @@ class StateManager:
         if current_boost < 1.0:
             remaining = max(0, data.boost_until - time.time())
             lines.append(f"  Boost 剩余: {remaining / 60:.1f} 分钟")
-        if data.follow_up.user_ids:
-            lines.append(f"  跟进用户: {', '.join(sorted(data.follow_up.user_ids))}")
-        if data.follow_up.keywords:
-            lines.append(f"  跟进关键词: {', '.join(sorted(data.follow_up.keywords))}")
-        if data.follow_up.reason:
-            lines.append(f"  跟进原因: {data.follow_up.reason}")
+        anchor = data.anchor
+        if anchor.has_context:
+            kind_text = anchor.kind or "-"
+            lines.append(f"  锚点类型: {kind_text}")
+        if anchor.topic:
+            lines.append(f"  锚点话题: {anchor.topic}")
+        if anchor.participants:
+            lines.append(f"  锚点用户: {', '.join(sorted(anchor.participants))}")
+        if anchor.keywords:
+            lines.append(f"  锚点关键词: {', '.join(sorted(anchor.keywords))}")
+        if anchor.reason:
+            lines.append(f"  锚点原因: {anchor.reason}")
+        lines.append(f"  今日发起: {data.initiate_daily_count} 次")
+        if data.initiate_pending_since > 0:
+            waiting = (time.time() - data.initiate_pending_since) / 60
+            lines.append(f"  发起接话等待中: {waiting:.1f} 分钟")
+        if data.initiate_no_reply_streak > 0:
+            lines.append(f"  无人接话 streak: {data.initiate_no_reply_streak}")
         return "\n".join(lines)

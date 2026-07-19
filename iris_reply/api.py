@@ -27,6 +27,7 @@ def group_state_summary(state: StateManager, group_id: str) -> dict:
         "effective_t": effective_t,
         "backoff_level": data.backoff_level,
         "consecutive_replies": data.consecutive_replies,
+        "initiate_daily_count": data.initiate_daily_count,
     }
 
 
@@ -100,10 +101,15 @@ def register_web_apis(
         groups = []
         for gid in state.get_whitelist():
             data = state.get_state(gid)
+            anchor = data.anchor
             entry = {"group_id": gid, **group_state_summary(state, gid)}
-            entry["follow_up_users"] = sorted(data.follow_up.user_ids)
-            entry["follow_up_keywords"] = sorted(data.follow_up.keywords)
-            entry["follow_up_reason"] = data.follow_up.reason
+            entry["anchor_kind"] = anchor.kind
+            entry["anchor_users"] = sorted(anchor.participants)
+            entry["anchor_keywords"] = sorted(anchor.keywords)
+            entry["anchor_reason"] = anchor.reason
+            entry["anchor_bot_message"] = anchor.bot_message
+            entry["initiate_pending"] = data.initiate_pending_since > 0
+            entry["initiate_no_reply_streak"] = data.initiate_no_reply_streak
             groups.append(entry)
         return jsonify(groups)
 

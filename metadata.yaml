@@ -1,6 +1,6 @@
 name: astrbot_plugin_iris_reply
 display_name: Iris Reply
-desc: 信号驱动的群聊主动回复插件，通过本地语义盲计数 + LLM 语义决策实现低成本主动介入
+desc: 统一决策模型的群聊主动发言插件：跟话/跟进/发起三种场景共享信号门控 + LLM 语义决策
 author: Leafiber
-version: 0.1.0
+version: 0.2.0
 repo: https://github.com/leafliber/astrbot_plugin_iris_reply

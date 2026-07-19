@@ -26,6 +26,16 @@ _DEFAULTS = {
     "boost_factor": 0.6,
     "boost_duration": 15,
     "max_boosted_replies": 5,
+    "proactive_enabled": False,
+    "proactive_check_interval": 5,
+    "proactive_quiet_minutes": 120,
+    "proactive_max_per_day": 2,
+    "proactive_min_interval": 360,
+    "proactive_drift_delay": 15,
+    "proactive_pending_timeout": 30,
+    "proactive_max_streak": 2,
+    "proactive_instruction": "",
+    "proactive_max_message_len": 300,
 }
 
 # Keys managed exclusively through the pages UI (stored in KV overrides).
@@ -68,14 +78,14 @@ _CONFIG_META = {
         "hint": "提交给 LLM 的上下文最大 token 数",
     },
     "follow_up_ttl": {
-        "label": "跟进注册表默认 TTL（分钟）",
+        "label": "跟进锚点默认 TTL（分钟）",
         "type": "int", "min": 5, "max": 120,
-        "hint": "动态跟进记录的存活时长",
+        "hint": "对话锚点中关注用户/关键词的存活时长",
     },
     "follow_up_aggregate_window": {
         "label": "follow-up 消息聚合等待窗口（秒）",
         "type": "int", "min": 3, "max": 30,
-        "hint": "被关注用户发言后等待此时间再触发 LLM 评估",
+        "hint": "锚点命中后等待此时间再触发 LLM 评估",
     },
     "quality_threshold": {
         "label": "消息质量评分阈值",
@@ -101,6 +111,56 @@ _CONFIG_META = {
         "label": "最大连续回复 boost 次数",
         "type": "int", "min": 2, "max": 10,
         "hint": "连续回复不超过此次数时享受完整 boost，超出后逐渐减弱",
+    },
+    "proactive_enabled": {
+        "label": "启用主动发起会话",
+        "type": "bool",
+        "hint": "开启后，Iris 会在群冷场或话题结束时主动开启话题",
+    },
+    "proactive_check_interval": {
+        "label": "发起检查周期（分钟）",
+        "type": "int", "min": 1, "max": 30,
+        "hint": "每隔此时间扫描一次白名单群，评估是否满足发起条件",
+    },
+    "proactive_quiet_minutes": {
+        "label": "冷场静默阈值（分钟）",
+        "type": "int", "min": 30, "max": 720,
+        "hint": "群内最后一条消息超过此时间无人说话，才考虑主动发起",
+    },
+    "proactive_max_per_day": {
+        "label": "每日最大发起次数",
+        "type": "int", "min": 1, "max": 10,
+        "hint": "每个群每天最多主动发起的次数",
+    },
+    "proactive_min_interval": {
+        "label": "两次发起最小间隔（分钟）",
+        "type": "int", "min": 60, "max": 1440,
+        "hint": "同一群两次主动发起之间的最小时间间隔",
+    },
+    "proactive_drift_delay": {
+        "label": "话题结束后发起延迟（分钟）",
+        "type": "int", "min": 5, "max": 120,
+        "hint": "检测到话题结束（drifted）后，若持续静默此时间可提前发起新话题",
+    },
+    "proactive_pending_timeout": {
+        "label": "发起接话等待（分钟）",
+        "type": "int", "min": 5, "max": 120,
+        "hint": "发起后等待群友接话的时间，超时视为无人接话",
+    },
+    "proactive_max_streak": {
+        "label": "当日无人接话上限（次）",
+        "type": "int", "min": 1, "max": 5,
+        "hint": "连续发起无人接话达到此次数后，当天不再发起",
+    },
+    "proactive_instruction": {
+        "label": "发起话题倾向（可选）",
+        "type": "str",
+        "hint": "自定义发起话题的偏好说明，如「多聊技术话题」，留空由 Iris 自行发挥",
+    },
+    "proactive_max_message_len": {
+        "label": "发起消息最大长度（字符）",
+        "type": "int", "min": 50, "max": 1000,
+        "hint": "主动发起消息超过此长度将被截断",
     },
 }
 
@@ -143,6 +203,11 @@ class ConfigManager:
                 lo, hi = meta.get("min"), meta.get("max")
                 if lo is not None: v = max(lo, v)
                 if hi is not None: v = min(hi, v)
+            elif meta.get("type") == "bool":
+                if not isinstance(v, bool):
+                    v = str(v).strip().lower() in ("true", "1", "yes", "on")
+            elif meta.get("type") == "str":
+                v = str(v).strip()
             self._overrides[key] = v
 
     def get_all_page_config(self) -> dict[str, Any]:
@@ -245,3 +310,46 @@ class ConfigManager:
     @property
     def max_boosted_replies(self) -> int:
         return max(2, min(10, int(self._get("max_boosted_replies"))))
+
+    @property
+    def proactive_enabled(self) -> bool:
+        v = self._get("proactive_enabled")
+        if isinstance(v, bool):
+            return v
+        return str(v).strip().lower() in ("true", "1", "yes", "on")
+
+    @property
+    def proactive_check_interval(self) -> int:
+        return max(1, min(30, int(self._get("proactive_check_interval"))))
+
+    @property
+    def proactive_quiet_minutes(self) -> int:
+        return max(30, min(720, int(self._get("proactive_quiet_minutes"))))
+
+    @property
+    def proactive_max_per_day(self) -> int:
+        return max(1, min(10, int(self._get("proactive_max_per_day"))))
+
+    @property
+    def proactive_min_interval(self) -> int:
+        return max(60, min(1440, int(self._get("proactive_min_interval"))))
+
+    @property
+    def proactive_drift_delay(self) -> int:
+        return max(5, min(120, int(self._get("proactive_drift_delay"))))
+
+    @property
+    def proactive_pending_timeout(self) -> int:
+        return max(5, min(120, int(self._get("proactive_pending_timeout"))))
+
+    @property
+    def proactive_max_streak(self) -> int:
+        return max(1, min(5, int(self._get("proactive_max_streak"))))
+
+    @property
+    def proactive_instruction(self) -> str:
+        return str(self._get("proactive_instruction", ""))
+
+    @property
+    def proactive_max_message_len(self) -> int:
+        return max(50, min(1000, int(self._get("proactive_max_message_len"))))

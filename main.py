@@ -23,17 +23,19 @@ from astrbot.core.provider.entities import LLMResponse, ProviderRequest
 from .iris_reply.admin import AdminCommands
 from .iris_reply.api import register_web_apis, sync_stats_group_state
 from .iris_reply.config import ConfigManager
-from .iris_reply.parser import parse_trigger
+from .iris_reply.decision import DecisionCore, DecisionRequest
 from .iris_reply.perception import ContextPackager, Gatekeeper, SlidingWindow, WindowMessage
-from .iris_reply.prompts import WILLINGNESS_PROMPTS
+from .iris_reply.prompts import SPEAK_HINTS
+from .iris_reply.proactive import ProactiveEngine
+from .iris_reply.signals import SignalGate
 from .iris_reply.state import StateManager
 from .iris_reply.stats import StatsCollector
 from .iris_reply.tools import ToolContext
-from .iris_reply.trigger import TriggerEngine
 
 PLUGIN_NAME = "astrbot_plugin_iris_reply"
 
 _IRIS_ACTIVE_TIMEOUT = 120
+_UMO_KV_KEY = "iris_reply:group_umo"
 
 
 class IrisReply(Star):
@@ -45,20 +47,41 @@ class IrisReply(Star):
         self._gatekeeper = Gatekeeper(self._config, self._state)
         self._sliding_window = SlidingWindow(self._config)
         self._context_packager = ContextPackager(self._config)
-        self._trigger_engine = TriggerEngine(self._config, self._state)
+        self._signals = SignalGate(self._config, self._state)
+        self._decision_core = DecisionCore(
+            self._config, self._state, self._sliding_window, self._context_packager,
+        )
         self._tool_ctx = ToolContext()
         self._admin = AdminCommands(self._state)
         self._stats = StatsCollector()
         self._reply_in_progress: dict[str, float] = {}
         self._passive_active: dict[str, float] = {}
-        self._observation_cache: dict[str, str] = {}
         self._triggering: dict[str, float] = {}
         self._follow_pending: set[str] = set()
+        self._group_umo: dict[str, str] = {}
+        self._umo_dirty: bool = False
+        self._self_id: str = ""
         self._save_task: asyncio.Task | None = None
         self._save_interval = 30
+        self._proactive = ProactiveEngine(
+            self.context,
+            self._config,
+            self._state,
+            self._sliding_window,
+            self._signals,
+            self._decision_core,
+            self._stats,
+            umo_get=lambda gid: self._group_umo.get(gid),
+            is_busy=self._is_busy,
+            self_id_get=lambda: self._self_id,
+            save_fn=lambda: self._state.save_dirty(self._kv_save),
+        )
 
     async def initialize(self) -> None:
         await self._state.load_all(self._kv_load)
+        umo_data = await self._kv_load(_UMO_KV_KEY)
+        if isinstance(umo_data, dict):
+            self._group_umo = {str(k): str(v) for k, v in umo_data.items()}
         config_overrides = await self._kv_load("iris_reply:config_overrides")
         self._config.load_overrides(config_overrides)
         self._save_task = asyncio.create_task(self._periodic_save())
@@ -72,9 +95,11 @@ class IrisReply(Star):
             window=self._sliding_window,
             kv_save=self._kv_save,
         )
+        await self._proactive.start()
         logger.info("Iris Reply: initialized")
 
     async def terminate(self) -> None:
+        await self._proactive.stop()
         if self._save_task and not self._save_task.done():
             self._save_task.cancel()
             try:
@@ -83,6 +108,7 @@ class IrisReply(Star):
                 pass
         await self._state.save_all(self._kv_save)
         await self._kv_save("iris_reply:config_overrides", self._config.get_overrides())
+        await self._kv_save(_UMO_KV_KEY, dict(self._group_umo))
         self._follow_pending.clear()
         self._reply_in_progress.clear()
         self._passive_active.clear()
@@ -95,6 +121,9 @@ class IrisReply(Star):
             try:
                 await self._state.save_dirty(self._kv_save)
                 await self._kv_save("iris_reply:config_overrides", self._config.get_overrides())
+                if self._umo_dirty:
+                    self._umo_dirty = False
+                    await self._kv_save(_UMO_KV_KEY, dict(self._group_umo))
                 self._sliding_window.cleanup(self._state.get_whitelist())
                 self._cleanup_stale_active()
                 sync_stats_group_state(self._state, self._stats)
@@ -116,9 +145,13 @@ class IrisReply(Star):
         for gid in stale_triggering:
             logger.info("Iris Reply: cleaning up stale triggering for group %s", gid)
             self._triggering.pop(gid, None)
-        stale_obs = [gid for gid in self._observation_cache if gid not in self._reply_in_progress and gid not in self._triggering]
-        for gid in stale_obs:
-            self._observation_cache.pop(gid, None)
+
+    def _is_busy(self, group_id: str) -> bool:
+        return (
+            group_id in self._reply_in_progress
+            or group_id in self._triggering
+            or group_id in self._passive_active
+        )
 
     async def _kv_save(self, key: str, value: Any) -> None:
         await self.put_kv_data(key, value)
@@ -164,7 +197,7 @@ class IrisReply(Star):
             return "error: too many user_ids (max 10 per call)"
 
         async with self._state.get_lock(group_id):
-            self._state.add_follow_up(group_id, user_ids=uid_list)
+            self._state.add_anchor_watch(group_id, users=uid_list)
         logger.debug("Iris Reply: add_follow_up for group %s, users=%s", group_id, uid_list)
         return f"ok: following users={uid_list}"
 
@@ -182,7 +215,7 @@ class IrisReply(Star):
         uid_list = [u.strip() for u in user_ids.split(",") if u.strip()] if user_ids else None
 
         async with self._state.get_lock(group_id):
-            self._state.remove_follow_up(group_id, user_ids=uid_list)
+            self._state.remove_anchor_watch(group_id, user_ids=uid_list)
         logger.debug("Iris Reply: end_follow_up for group %s, users=%s", group_id, uid_list)
         return f"ok: removed follow-up users={uid_list}"
 
@@ -267,6 +300,16 @@ class IrisReply(Star):
         await self._state.save_dirty(self._kv_save)
         event.set_result(msg)
 
+    @iris.command("initiate")
+    async def cmd_initiate(self, event) -> None:
+        group_id = self._get_group_id(event)
+        if not group_id:
+            return
+        result = await self._proactive.attempt_initiate(group_id, force=True)
+        event.set_result(f"主动发起: {result}")
+
+    # ---- 消息唤醒：门控 → 标记 → 交由 on_llm_request 决策 ----
+
     @event_message_type(EventMessageType.GROUP_MESSAGE)
     async def on_message(self, event) -> None:
         if not self._config.enabled:
@@ -279,14 +322,24 @@ class IrisReply(Star):
         if not group_id:
             return
 
+        # 缓存会话标识与自身 ID，供主动发起通路使用
+        umo = getattr(event, "unified_msg_origin", "")
+        if umo and self._group_umo.get(group_id) != umo:
+            self._group_umo[group_id] = umo
+            self._umo_dirty = True
+        if not self._self_id:
+            self._self_id = event.get_self_id() or ""
+
         message_str = event.message_str or ""
         sender_id = event.get_sender_id()
         sender_name = event.get_sender_name() or sender_id
 
-        is_followed = bool(sender_id and self._state.match_follow_up(group_id, sender_id))
+        # 发起后的首次接话：清除 pending，该消息直接获得一次跟进评估资格
+        pending_reply = self._state.consume_initiate_pending(group_id)
+        is_followed = bool(sender_id and self._state.match_anchor_user(group_id, sender_id))
 
         score = self._gatekeeper.quality_score(message_str)
-        if score < self._config.quality_threshold and not is_followed:
+        if score < self._config.quality_threshold and not is_followed and not pending_reply:
             return
 
         self._sliding_window.append(
@@ -306,17 +359,19 @@ class IrisReply(Star):
             event.set_extra("iris_mode", "passive")
             return
 
-        if group_id in self._reply_in_progress or group_id in self._triggering:
+        if self._is_busy(group_id) or self._proactive.is_initiating(group_id):
             logger.debug("Iris Reply: reply already in progress for group %s", group_id)
             return
 
         async with self._state.get_lock(group_id):
-            trigger_reason = self._trigger_engine.evaluate(event)
+            motive = self._signals.evaluate_message(group_id, sender_id, message_str)
 
-        if not trigger_reason:
+        if not motive and pending_reply:
+            motive = "follow_up"
+        if not motive:
             return
 
-        is_follow_up = trigger_reason in ("follow_up", "keyword_follow_up")
+        is_follow_up = motive == "follow_up"
 
         if is_follow_up:
             if group_id in self._follow_pending:
@@ -328,10 +383,9 @@ class IrisReply(Star):
             finally:
                 self._follow_pending.discard(group_id)
 
-            if group_id in self._reply_in_progress or group_id in self._triggering:
+            if self._is_busy(group_id):
                 return
-            follow_up_users, follow_up_keywords, _ = self._state.get_follow_up_info(group_id)
-            if not follow_up_users and not follow_up_keywords:
+            if not pending_reply and not self._state.get_anchor(group_id).active:
                 return
 
         if not self._state.can_detect(group_id, follow_up=is_follow_up):
@@ -352,10 +406,9 @@ class IrisReply(Star):
             self._state.record_detect_time(group_id)
             self._triggering[group_id] = time.time()
 
-        event.set_extra("iris_trigger", {
-            "trigger_reason": trigger_reason,
+        event.set_extra("iris_decision", {
+            "motive": motive,
             "provider_id": provider_id,
-            "is_follow_up": is_follow_up,
         })
 
         event.is_at_or_wake_command = True
@@ -364,9 +417,11 @@ class IrisReply(Star):
             event.set_extra("selected_provider", provider_id)
         self._tool_ctx.set_context(group_id)
         logger.info(
-            "Iris Reply: trigger activated (%s) for group %s, deferred to on_llm_request",
-            trigger_reason, group_id,
+            "Iris Reply: %s candidate activated for group %s, deferred to on_llm_request",
+            motive, group_id,
         )
+
+    # ---- 统一决策：消息唤醒的 LLM 评估 ----
 
     @on_llm_request()
     async def handle_llm_request(self, event, request: ProviderRequest) -> None:
@@ -374,38 +429,20 @@ class IrisReply(Star):
         if not group_id or group_id not in self._triggering:
             return
 
-        trigger_info = event.get_extra("iris_trigger")
-        if not trigger_info:
+        info = event.get_extra("iris_decision")
+        if not info:
             self._triggering.pop(group_id, None)
             return
 
-        trigger_reason = trigger_info.get("trigger_reason", "")
-        provider_id = trigger_info.get("provider_id", "")
-        is_follow_up = trigger_info.get("is_follow_up", False)
+        motive = info.get("motive", "")
+        provider_id = info.get("provider_id", "")
 
-        messages = self._sliding_window.get_messages(group_id)
-        context_text = self._context_packager.package(group_id, messages, trigger_reason)
+        req = DecisionRequest(group_id=group_id, wake="message", motive=motive)
+        outcome = await self._decision_core.decide(req, self.context.llm_generate, provider_id)
 
-        user_prompt, prompts = self._build_trigger_user_prompt(group_id)
-
-        if is_follow_up:
-            user_prompt += self._build_follow_up_reminder(group_id, trigger_reason)
-
-        user_prompt += "\n\n" + context_text
-
-        self._stats.record_trigger_start(
-            group_id, trigger_reason, prompts["trigger_system"], user_prompt,
-        )
-
-        try:
-            response = await self.context.llm_generate(
-                chat_provider_id=provider_id,
-                prompt=user_prompt,
-                system_prompt=prompts["trigger_system"],
-            )
-        except Exception as e:
-            logger.error("Iris Reply: trigger LLM call failed for group %s: %s", group_id, e)
-            self._stats.record_trigger_error(group_id)
+        if outcome.error or outcome.decision is None:
+            logger.error("Iris Reply: decision LLM call failed for group %s: %s", group_id, outcome.error)
+            self._stats.record_decision_error(group_id, motive)
             async with self._state.get_lock(group_id):
                 self._state.record_skip_reply(group_id)
             await self._state.save_dirty(self._kv_save)
@@ -413,30 +450,31 @@ class IrisReply(Star):
             event.stop_event()
             return
 
-        completion = response.completion_text or ""
-        logger.info("Iris Reply: trigger raw response for group %s (len=%d): %.500s", group_id, len(completion), completion)
-        result = parse_trigger(completion)
+        decision = outcome.decision
         logger.info(
-            "Iris Reply: trigger parsed for group %s: reply=%s, drifted=%s, watch=%s, watch_keywords=%s",
-            group_id, result.should_reply, result.topic_drifted, result.follow_up_users, result.follow_up_keywords,
+            "Iris Reply: decision raw for group %s (motive=%s, len=%d): %.500s",
+            group_id, motive, len(outcome.raw_text), outcome.raw_text,
+        )
+        self._stats.record_decision(
+            group_id, motive,
+            system_prompt=outcome.system_prompt,
+            user_prompt=outcome.user_prompt,
+            response_text=outcome.raw_text,
+            decision=decision,
+            duration_ms=outcome.duration_ms,
+        )
+        logger.info(
+            "Iris Reply: decision parsed for group %s: speak=%s, drifted=%s, watch=%s, watch_keywords=%s, cooldown=%d",
+            group_id, decision.should_speak, decision.drifted,
+            decision.watch, decision.watch_keywords, decision.cooldown_minutes,
         )
 
-        if result.observation:
-            self._observation_cache[group_id] = result.observation
+        async with self._state.get_lock(group_id):
+            if decision.observation:
+                self._state.set_observation(group_id, decision.observation)
 
-        self._stats.record_trigger_result(
-            group_id=group_id,
-            response_text=completion,
-            should_reply=result.should_reply,
-            observation=result.observation,
-            follow_up_users=result.follow_up_users,
-            follow_up_keywords=result.follow_up_keywords,
-            interest_reason=result.interest_reason,
-            topic_drifted=result.topic_drifted,
-        )
-
-        if result.parse_failed:
-            logger.warning("Iris Reply: trigger parse failed for group %s, skipping without backoff", group_id)
+        if decision.parse_failed:
+            logger.warning("Iris Reply: decision parse failed for group %s", group_id)
             async with self._state.get_lock(group_id):
                 self._state.record_skip_reply(group_id)
             await self._state.save_dirty(self._kv_save)
@@ -445,7 +483,7 @@ class IrisReply(Star):
             return
 
         if group_id in self._passive_active:
-            logger.info("Iris Reply: aborting proactive trigger for group %s, passive reply in progress", group_id)
+            logger.info("Iris Reply: aborting %s for group %s, passive reply in progress", motive, group_id)
             async with self._state.get_lock(group_id):
                 self._state.record_skip_reply(group_id)
             await self._state.save_dirty(self._kv_save)
@@ -453,38 +491,49 @@ class IrisReply(Star):
             event.stop_event()
             return
 
-        if result.topic_drifted:
+        if decision.cooldown_minutes:
             async with self._state.get_lock(group_id):
-                self._state.clear_follow_up(group_id)
+                actual = self._state.set_cooldown(group_id, decision.cooldown_minutes)
+                self._state.record_skip_reply(group_id)
             await self._state.save_dirty(self._kv_save)
-            logger.info("Iris Reply: topic drifted for group %s, cleared follow-up", group_id)
+            logger.info("Iris Reply: decision requested cooldown %d min for group %s", actual, group_id)
             self._triggering.pop(group_id, None)
             event.stop_event()
             return
 
-        if result.follow_up_users or result.follow_up_keywords:
-            if result.should_reply:
-                event.set_extra("iris_pending_fu", (
-                    result.follow_up_users, result.follow_up_keywords, result.interest_reason,
+        if decision.drifted:
+            async with self._state.get_lock(group_id):
+                self._state.close_anchor(group_id)
+                self._state.record_drift(group_id)
+            await self._state.save_dirty(self._kv_save)
+            logger.info("Iris Reply: topic drifted for group %s, anchor closed", group_id)
+            self._triggering.pop(group_id, None)
+            event.stop_event()
+            return
+
+        if decision.watch or decision.watch_keywords:
+            if decision.should_speak:
+                event.set_extra("iris_pending_watch", (
+                    decision.watch, decision.watch_keywords, decision.why,
                 ))
             else:
                 async with self._state.get_lock(group_id):
-                    self._state.add_follow_up(
+                    self._state.add_anchor_watch(
                         group_id,
-                        user_ids=result.follow_up_users or None,
-                        keywords=result.follow_up_keywords or None,
-                        reason=result.interest_reason,
+                        users=decision.watch or None,
+                        keywords=decision.watch_keywords or None,
+                        reason=decision.why,
                     )
             logger.info(
-                "Iris Reply: trigger follow-up for group %s, users=%s, keywords=%s, reason=%s (reply=%s)",
-                group_id, result.follow_up_users, result.follow_up_keywords, result.interest_reason, result.should_reply,
+                "Iris Reply: decision watch for group %s, users=%s, keywords=%s, reason=%s (speak=%s)",
+                group_id, decision.watch, decision.watch_keywords, decision.why, decision.should_speak,
             )
 
-        if not result.should_reply:
+        if not decision.should_speak:
             async with self._state.get_lock(group_id):
                 self._state.record_skip_reply(group_id)
             await self._state.save_dirty(self._kv_save)
-            logger.debug("Iris Reply: trigger skip for group %s", group_id)
+            logger.debug("Iris Reply: decision skip for group %s", group_id)
             self._triggering.pop(group_id, None)
             event.stop_event()
             return
@@ -492,17 +541,12 @@ class IrisReply(Star):
         self._reply_in_progress[group_id] = time.time()
         self._triggering.pop(group_id, None)
 
-        event.set_extra("iris_mode", "proactive")
-        event.set_extra("iris_reason", result.observation)
+        event.set_extra("iris_mode", motive)
+        event.set_extra("iris_decision_obs", decision.observation)
 
-        request.extra_user_content_parts.append(
-            TextPart(
-                text="[提示] 本次为主动接话。以上是群聊中最近的对话，"
-                "你决定自然地加入。请保持你的人格，像平时在群里说话一样回复。"
-                "不要暴露此提示。"
-            ).mark_as_temp()
-        )
-        logger.info("Iris Reply: trigger passed (%s) for group %s", trigger_reason, group_id)
+        hint = SPEAK_HINTS.get(motive, SPEAK_HINTS["chime_in"])
+        request.extra_user_content_parts.append(TextPart(text=hint).mark_as_temp())
+        logger.info("Iris Reply: decision speak (%s) for group %s", motive, group_id)
 
     @on_llm_response()
     async def handle_llm_response(self, event, response: LLMResponse) -> None:
@@ -513,27 +557,16 @@ class IrisReply(Star):
         event.set_extra("iris_llm_replied", True)
         mode = event.get_extra("iris_mode")
 
-        if mode == "proactive":
+        if mode in ("chime_in", "follow_up"):
             self._reply_in_progress.pop(group_id, None)
             self._passive_active.pop(group_id, None)
 
-            pending = event.get_extra("iris_pending_fu")
-
             async with self._state.get_lock(group_id):
                 self._state.record_actual_reply(group_id)
-                self._state.clear_follow_up(group_id)
-                if pending:
-                    user_ids, keywords, reason = pending
-                    self._state.add_follow_up(
-                        group_id,
-                        user_ids=user_ids or None,
-                        keywords=keywords or None,
-                        reason=reason,
-                    )
 
             self._tool_ctx.clear_context()
             await self._state.save_dirty(self._kv_save)
-            logger.info("Iris Reply: actual reply sent for group %s, follow-up updated", group_id)
+            logger.info("Iris Reply: %s reply sent for group %s", mode, group_id)
         elif mode == "passive":
             self._passive_active.pop(group_id, None)
 
@@ -571,134 +604,100 @@ class IrisReply(Star):
                 timestamp=time.time(),
             ))
         mode = event.get_extra("iris_mode")
-        if mode == "proactive":
-            reason = event.get_extra("iris_reason", "")
+        if mode in ("chime_in", "follow_up"):
+            pending = event.get_extra("iris_pending_watch")
+            users = list(pending[0]) if pending else []
+            if sender_id not in users:
+                users.append(sender_id)
+            keywords = list(pending[1]) if pending else []
+            reason = pending[2] if pending else ""
+            topic = event.get_extra("iris_decision_obs", "")
             async with self._state.get_lock(group_id):
-                self._state.add_follow_up(group_id, user_ids=[sender_id], ttl_minutes=3, reason=reason)
+                self._state.write_anchor(
+                    group_id,
+                    kind=mode,
+                    topic=topic,
+                    bot_message=bot_text,
+                    users=users,
+                    keywords=keywords or None,
+                    reason=reason,
+                )
             await self._state.save_dirty(self._kv_save)
-            logger.debug("Iris Reply: short-TTL follow-up sender %s in group %s after proactive reply", sender_id, group_id)
+            logger.debug("Iris Reply: anchor written (%s) for group %s", mode, group_id)
         elif mode == "passive":
             provider_id = self._config.provider_id or await self._get_provider_id(event)
             if provider_id:
-                await self._passive_follow_up_eval(group_id, provider_id, sender_id)
+                await self._passive_watch_eval(group_id, provider_id, sender_id, bot_text)
             else:
                 async with self._state.get_lock(group_id):
-                    self._state.add_follow_up(group_id, user_ids=[sender_id])
+                    self._state.write_anchor(
+                        group_id, kind="passive", bot_message=bot_text, users=[sender_id],
+                    )
                 await self._state.save_dirty(self._kv_save)
         elif event.get_extra("iris_llm_replied"):
             async with self._state.get_lock(group_id):
-                self._state.add_follow_up(group_id, user_ids=[sender_id])
+                self._state.write_anchor(
+                    group_id, kind="reply", bot_message=bot_text, users=[sender_id],
+                )
             await self._state.save_dirty(self._kv_save)
-            logger.debug("Iris Reply: default follow-up sender %s in group %s after LLM reply", sender_id, group_id)
+            logger.debug("Iris Reply: anchor written (reply) for group %s", group_id)
 
-    def _build_observation_block(self, group_id: str) -> str:
-        """构建 <recent_observation> 块，若无缓存则返回空字符串。"""
-        cached_obs = self._observation_cache.get(group_id)
-        if cached_obs:
-            return f"\n\n<recent_observation>之前的观察：{cached_obs}</recent_observation>"
-        return ""
-
-    def _build_follow_up_reminder(
-        self, group_id: str, trigger_reason: str = "", include_drifted: bool = True,
-    ) -> str:
-        """构建 <follow_up_reminder> 块，若无跟进信息则返回空字符串。"""
-        follow_up_users, follow_up_keywords, follow_up_reason = self._state.get_follow_up_info(group_id)
-        reminder_parts = []
-        if follow_up_users:
-            reminder_parts.append(f"你之前表示对这些用户感兴趣：{', '.join(follow_up_users)}")
-        if follow_up_keywords:
-            reminder_parts.append(f"你之前表示对这些关键词感兴趣：{', '.join(follow_up_keywords)}")
-        if not reminder_parts:
-            return ""
-        text = f"\n\n<follow_up_reminder>{'；'.join(reminder_parts)}"
-        if follow_up_reason:
-            text += f"，原因：{follow_up_reason}"
-        if include_drifted:
-            if trigger_reason == "follow_up":
-                text += (
-                    "。现在其中有人发言了（可能连续发了多条），"
-                    "请综合评估所有新消息后决定是否回复。"
-                )
-            elif trigger_reason:
-                text += (
-                    "。现在对话中出现了你关注的关键词，"
-                    "请综合评估上下文后决定是否回复。"
-                )
-            text += "如果当前话题已经偏离了你之前关注的原因，将 drifted 设为 true。"
-        text += "</follow_up_reminder>"
-        return text
-
-    def _build_trigger_user_prompt(self, group_id: str, instruction: str = "") -> tuple[str, dict]:
-        """组装触发评估 user prompt 的基础部分（persona + 可选指令 + 观察块）。
-
-        返回 (user_prompt, prompts)，调用方按需追加 follow-up 提醒与上下文文本。
-        """
-        willingness = self._state.get_willingness(group_id)
-        prompts = WILLINGNESS_PROMPTS[willingness]
-        user_prompt = prompts["persona"]
-        if instruction:
-            user_prompt += f"\n\n<instruction>{instruction}</instruction>"
-        user_prompt += self._build_observation_block(group_id)
-        return user_prompt, prompts
-
-    async def _passive_follow_up_eval(
-        self, group_id: str, provider_id: str, fallback_sender: str,
+    async def _passive_watch_eval(
+        self, group_id: str, provider_id: str, fallback_sender: str, bot_text: str,
     ) -> None:
-        messages = self._sliding_window.get_messages(group_id)
-        if not messages:
+        """被动回复后的跟进评估（motive=watch）：只决定是否建立关注锚点。"""
+        if not self._sliding_window.get_messages(group_id):
             return
 
-        context_text = self._context_packager.package(group_id, messages, "passive")
+        req = DecisionRequest(group_id=group_id, wake="message", motive="watch")
+        outcome = await self._decision_core.decide(req, self.context.llm_generate, provider_id)
 
-        user_prompt, prompts = self._build_trigger_user_prompt(
-            group_id,
-            instruction="本次为被动回复后的跟进评估，你必须将 reply 设为 false，"
-            "只需判断是否需要关注后续对话。",
-        )
-
-        user_prompt += self._build_follow_up_reminder(group_id, include_drifted=False)
-
-        user_prompt += "\n\n" + context_text
-
-        try:
-            response = await self.context.llm_generate(
-                chat_provider_id=provider_id,
-                prompt=user_prompt,
-                system_prompt=prompts["trigger_system"],
-            )
-        except Exception as e:
-            logger.warning("Iris Reply: passive follow-up eval failed for group %s: %s", group_id, e)
+        if outcome.error or outcome.decision is None:
+            logger.warning("Iris Reply: passive watch eval failed for group %s: %s", group_id, outcome.error)
+            self._stats.record_decision_error(group_id, "watch")
             async with self._state.get_lock(group_id):
-                self._state.add_follow_up(group_id, user_ids=[fallback_sender])
-            await self._state.save_dirty(self._kv_save)
-            return
-
-        result = parse_trigger(response.completion_text or "")
-        logger.info(
-            "Iris Reply: passive eval for group %s: watch=%s, keywords=%s, drifted=%s",
-            group_id, result.follow_up_users, result.follow_up_keywords, result.topic_drifted,
-        )
-
-        if result.observation:
-            self._observation_cache[group_id] = result.observation
-
-        if result.topic_drifted:
-            async with self._state.get_lock(group_id):
-                self._state.clear_follow_up(group_id)
-            await self._state.save_dirty(self._kv_save)
-            logger.info("Iris Reply: topic drifted (passive) for group %s, cleared follow-up", group_id)
-            return
-
-        if result.follow_up_users or result.follow_up_keywords:
-            async with self._state.get_lock(group_id):
-                self._state.add_follow_up(
-                    group_id,
-                    user_ids=result.follow_up_users or None,
-                    keywords=result.follow_up_keywords or None,
-                    reason=result.interest_reason,
+                self._state.write_anchor(
+                    group_id, kind="passive", bot_message=bot_text, users=[fallback_sender],
                 )
             await self._state.save_dirty(self._kv_save)
-        else:
-            async with self._state.get_lock(group_id):
-                self._state.add_follow_up(group_id, user_ids=[fallback_sender])
-            await self._state.save_dirty(self._kv_save)
+            return
+
+        decision = outcome.decision
+        self._stats.record_decision(
+            group_id, "watch",
+            system_prompt=outcome.system_prompt,
+            user_prompt=outcome.user_prompt,
+            response_text=outcome.raw_text,
+            decision=decision,
+            duration_ms=outcome.duration_ms,
+        )
+        logger.info(
+            "Iris Reply: passive watch eval for group %s: watch=%s, keywords=%s, drifted=%s",
+            group_id, decision.watch, decision.watch_keywords, decision.drifted,
+        )
+
+        async with self._state.get_lock(group_id):
+            if decision.observation:
+                self._state.set_observation(group_id, decision.observation)
+            if decision.parse_failed:
+                self._state.write_anchor(
+                    group_id, kind="passive", bot_message=bot_text, users=[fallback_sender],
+                )
+            elif decision.drifted:
+                self._state.close_anchor(group_id)
+                self._state.record_drift(group_id)
+                logger.info("Iris Reply: topic drifted (passive) for group %s, anchor closed", group_id)
+            elif decision.watch or decision.watch_keywords:
+                self._state.write_anchor(
+                    group_id,
+                    kind="passive",
+                    bot_message=bot_text,
+                    users=decision.watch or None,
+                    keywords=decision.watch_keywords or None,
+                    reason=decision.why,
+                )
+            else:
+                self._state.write_anchor(
+                    group_id, kind="passive", bot_message=bot_text, users=[fallback_sender],
+                )
+        await self._state.save_dirty(self._kv_save)

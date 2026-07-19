@@ -6,54 +6,66 @@
 用户消息
   |
   v
-on_message (iris_reply) ─── 评估触发，设置 event.set_extra("iris_mode")
+on_message (iris_reply) ─── 信号门控评估，设置 event.set_extra("iris_mode")
 on_all_message (iris_chat_memory) ─── 添加到 L1 buffer
   |
   v
-[iris_reply 触发时]
-handle_llm_request (iris_reply) ─── 触发判断 llm_generate (不触发 hooks)
-  |  触发通过
+[iris_reply 门控命中时]
+handle_llm_request (iris_reply) ─── 统一决策 llm_generate (不触发 hooks)
+  |  决策发言
   v
 handle_llm_request (iris_chat_memory) ─── 清空 contexts, 注入 L1/L2/L3 (mark_as_temp)
-handle_llm_request (iris_reply) ─── 注入主动提示 (mark_as_temp)
+handle_llm_request (iris_reply) ─── 注入发言提示 (mark_as_temp)
   |
   v
-主 LLM 调用: system_prompt(人格) + L1(含bot回复) + L2/L3 + 主动提示
+主 LLM 调用: system_prompt(人格) + L1(含bot回复) + L2/L3 + 发言提示
   |
   v
 handle_llm_response (iris_chat_memory) ─── 添加 bot 回复到 L1
 handle_llm_response (iris_reply) ─── 从 event 读取模式, 记录回复
   |
   v
-on_message_sent (iris_reply) ─── 从 event 读取模式, 设置 follow-up
+on_message_sent (iris_reply) ─── 从 event 读取模式, 写入对话锚点
+
+[定时器主动发起通路（initiate）]
+ProactiveEngine 定时扫描 ─── 统一决策 llm_generate (不触发 hooks)
+  |
+  v
+context.send_message 直发 ─── 不经过任何事件钩子
+  |
+  v
+iris_reply 手动记账（入窗 / 锚点 / 接话 pending）
 ```
 
-## iris_reply 侧（已完成）
+## iris_reply 侧
 
-重构后的 iris_reply 通过 `event.set_extra` 传递回复模式，不再依赖共享状态变量。
-这确保了与 iris_chat_memory 的 hooks 完全兼容，两个插件的 `on_llm_request` /
+iris_reply 通过 `event.set_extra` 传递发言模式，不依赖共享状态变量，
+与 iris_chat_memory 的 hooks 完全兼容，两个插件的 `on_llm_request` /
 `on_llm_response` / `after_message_sent` 钩子互不干扰。
 
 关键设计：
-- `llm_generate` 直接调用 `prov.text_chat()`，不触发 hooks，触发判断和被动评估
-  的内部 LLM 调用不会触发 iris_chat_memory 的注入逻辑
+- `iris_mode` 取值：`chime_in`（跟话）/ `follow_up`（跟进）/ `passive`（被动回复），
+  跟随 event 生命周期，无跨事件竞态
+- 统一决策与被动评估的 `llm_generate` 直接调用 `prov.text_chat()`，不触发 hooks，
+  不会触发 iris_chat_memory 的注入逻辑
 - 所有注入内容均使用 `mark_as_temp()`，不污染对话历史
-- `iris_mode` 通过 event 传递，跟随 event 生命周期，无跨事件竞态
+- **主动发起（initiate）为直发通路**：`context.send_message` 不经过事件管线，
+  不触发 `on_llm_request` / `on_llm_response` / `after_message_sent` 任何钩子
 
 ## iris_chat_memory 侧建议修改
 
-### 1. 检测 iris_reply 的主动回复（推荐）
+### 1. 检测 iris_reply 的主动发言（推荐）
 
 iris_chat_memory 的 `on_llm_request` 钩子可以通过检测 `event.get_extra("iris_mode")`
-来判断当前是否为 iris_reply 触发的主动回复，从而优化行为：
+来判断当前是否为 iris_reply 触发的主动发言，从而优化行为：
 
 ```python
 # iris_chat_memory 的 on_llm_request 中
 iris_mode = event.get_extra("iris_mode")
-if iris_mode == "proactive":
-    # iris_reply 注入了主动提示，此处仍注入 L1/L2/L3
+if iris_mode in ("chime_in", "follow_up"):
+    # iris_reply 注入了发言提示，此处仍注入 L1/L2/L3
     # 但可以降低 L2/L3 的 token 预算，因为 iris_reply 的滑动窗口
-    # 已在触发判断中提供了近期上下文
+    # 已在统一决策中提供了近期上下文
     pass
 ```
 
@@ -62,17 +74,24 @@ if iris_mode == "proactive":
 ### 2. 跳过冗余的被动触发检测（可选）
 
 iris_chat_memory 的 `_detect_passive_trigger` 检查 `event.is_at_or_wake_command`，
-而 iris_reply 在触发主动回复时也设置此标志。这不会产生冲突（iris_chat_memory 将其
+而 iris_reply 在触发主动发言时也设置此标志。这不会产生冲突（iris_chat_memory 将其
 视为"主动触发"而非"被动触发"是正确行为），但如果想更精确：
 
 ```python
 # iris_chat_memory 的被动触发检测中
-if event.get_extra("iris_mode") in ("proactive", "passive"):
+if event.get_extra("iris_mode") in ("chime_in", "follow_up", "passive"):
     # iris_reply 已处理触发逻辑，跳过 iris_chat_memory 的被动触发检测
     return False
 ```
 
-### 3. L1 buffer 中 bot 回复的格式（重要，无需修改）
+### 3. 主动发起消息对 L1 不可见（重要，新增）
+
+iris_reply 的主动发起（initiate）通过 `context.send_message` 直发，
+**不会触发任何事件钩子**，因此 iris_chat_memory 的 L1 buffer 中不会出现
+这类发起消息，只会在群友后续发言时间接体现。对绝大多数场景影响可忽略；
+若需要完整记忆，可在 iris_chat_memory 侧通过平台层消息回执（如可用）补充。
+
+### 4. L1 buffer 中 bot 回复的格式（重要，无需修改）
 
 iris_chat_memory 的 `on_llm_response` 将 bot 回复添加到 L1 buffer，格式为
 `[Bot昵称/时间]: 回复内容`。这正好解决了 iris_reply 的第三人称问题——LLM 能在
@@ -97,8 +116,8 @@ L1 上下文中看到自己的发言，维持自我身份认同。
 ### 不使用 iris_chat_memory 时
 
 如果不安装 iris_chat_memory，iris_reply 仍能正常工作：
-- 触发判断使用自己的 `SlidingWindow` + `ContextPackager` 构建上下文
-- 主动提示已修改为强化身份认同（"请保持你的人格，像平时在群里说话一样回复"）
+- 统一决策使用自己的 `SlidingWindow` + `ContextPackager` 构建上下文
+- 发言提示已强化身份认同（"请保持你的人格，像平时在群里说话一样回复"）
 - 但第三人称问题的修复效果有限——AstrBot 内置 group_chat_context 仍不包含
   bot 回复。建议在不使用 iris_chat_memory 时也考虑禁用 group_chat_context，
   或调低其 `group_message_max_cnt`

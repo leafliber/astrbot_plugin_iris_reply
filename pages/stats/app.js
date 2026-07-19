@@ -51,9 +51,19 @@ function willingnessSpan(level) {
 }
 
 function resultBadge(log) {
-  if (log.topic_drifted) return `<span class="badge badge-drift">话题偏移</span>`;
-  if (log.should_reply) return `<span class="badge badge-reply">回复</span>`;
+  if (log.drifted) return `<span class="badge badge-drift">话题偏移</span>`;
+  if (log.action === "speak") return `<span class="badge badge-reply">回复</span>`;
   return `<span class="badge badge-skip">跳过</span>`;
+}
+
+function motiveBadge(motive) {
+  const map = {
+    chime_in: "跟话",
+    follow_up: "跟进",
+    initiate: "发起",
+    watch: "评估",
+  };
+  return `<span class="badge badge-passive">${map[motive] || escapeHtml(motive)}</span>`;
 }
 
 document.querySelectorAll(".tab").forEach((tab) => {
@@ -110,13 +120,18 @@ async function renderManage() {
 
   let rows = "";
   for (const g of groups) {
-    const followUsers = (g.follow_up_users && g.follow_up_users.length)
-      ? g.follow_up_users.map(u => `<span class="badge badge-following">${escapeHtml(u)}</span>`).join(" ")
+    const anchorKind = g.anchor_kind
+      ? `<span class="badge badge-following">${escapeHtml(g.anchor_kind)}</span>`
       : '<span class="muted">-</span>';
-    const followKeywords = (g.follow_up_keywords && g.follow_up_keywords.length)
-      ? g.follow_up_keywords.map(k => `<span class="badge badge-drift">${escapeHtml(k)}</span>`).join(" ")
+    const anchorUsers = (g.anchor_users && g.anchor_users.length)
+      ? g.anchor_users.map(u => `<span class="badge badge-following">${escapeHtml(u)}</span>`).join(" ")
       : '<span class="muted">-</span>';
-    const followReason = g.follow_up_reason ? escapeHtml(g.follow_up_reason) : '<span class="muted">-</span>';
+    const anchorKeywords = (g.anchor_keywords && g.anchor_keywords.length)
+      ? g.anchor_keywords.map(k => `<span class="badge badge-drift">${escapeHtml(k)}</span>`).join(" ")
+      : '<span class="muted">-</span>';
+    const anchorReason = g.anchor_reason ? escapeHtml(g.anchor_reason) : '<span class="muted">-</span>';
+    const initiateCell = `${g.initiate_daily_count}` +
+      (g.initiate_pending ? ' <span class="badge badge-skip">等待接话</span>' : '');
 
     rows += `<tr>
       <td>${escapeHtml(g.group_id)}</td>
@@ -139,9 +154,11 @@ async function renderManage() {
       <td>${g.effective_n}/${g.effective_t}m</td>
       <td>${g.backoff_level}</td>
       <td>${g.consecutive_replies}</td>
-      <td>${followUsers}</td>
-      <td>${followKeywords}</td>
-      <td>${followReason}</td>
+      <td>${anchorKind}</td>
+      <td>${anchorUsers}</td>
+      <td>${anchorKeywords}</td>
+      <td>${anchorReason}</td>
+      <td>${initiateCell}</td>
       <td>
         <button class="action-btn" data-action="reset" data-group="${escapeHtml(g.group_id)}">重置</button>
         <button class="action-btn danger" data-action="disable" data-group="${escapeHtml(g.group_id)}">禁用</button>
@@ -168,9 +185,11 @@ async function renderManage() {
           <th>阈值 N/T</th>
           <th>退避</th>
           <th>连续</th>
-          <th>跟进用户</th>
-          <th>跟进关键词</th>
-          <th>跟进原因</th>
+          <th>锚点类型</th>
+          <th>锚点用户</th>
+          <th>锚点关键词</th>
+          <th>锚点原因</th>
+          <th>今日发起</th>
           <th>操作</th>
         </tr>
       </thead>
@@ -287,17 +306,18 @@ function renderStatsGroups(groups) {
         <th>群ID</th>
         <th>状态</th>
         <th>意愿</th>
-        <th>触发</th>
+        <th>决策</th>
         <th>回复</th>
         <th>跳过</th>
         <th>错误</th>
         <th>偏移</th>
+        <th>发起</th>
         <th>被动</th>
         <th>消息</th>
         <th>阈值 N/T</th>
         <th>退避</th>
         <th>连续</th>
-        <th>最近触发</th>
+        <th>最近决策</th>
       </tr>
     </thead>
     <tbody>`;
@@ -307,17 +327,18 @@ function renderStatsGroups(groups) {
       <td>${escapeHtml(g.group_id)}</td>
       <td>${stateBadge(g.current_state)}</td>
       <td>${willingnessSpan(g.willingness)}</td>
-      <td>${g.total_triggers}</td>
+      <td>${g.total_decisions}</td>
       <td>${g.total_replies}</td>
       <td>${g.total_skips}</td>
       <td>${g.total_errors}</td>
       <td>${g.total_drifts}</td>
+      <td>${g.total_initiates}</td>
       <td>${g.total_passive_replies}</td>
       <td>${g.msg_count}</td>
       <td>${g.effective_n}/${g.effective_t}m</td>
       <td>${g.backoff_level}</td>
       <td>${g.consecutive_replies}</td>
-      <td>${formatTime(g.last_trigger_time)}</td>
+      <td>${formatTime(g.last_decision_time)}</td>
     </tr>`;
   }
 
@@ -348,17 +369,18 @@ async function renderStatsLogs() {
           <div class="log-meta">
             ${resultBadge(log)}
             <span>${escapeHtml(log.group_id)}</span>
-            <span class="badge badge-passive">${log.trigger_reason}</span>
+            ${motiveBadge(log.motive)}
             <span class="duration">${formatDuration(log.duration_ms)}</span>
           </div>
           <span class="log-time">${formatTime(log.timestamp)}</span>
         </div>
         <div class="log-detail" id="${id}">
+          ${log.message ? `<label>发言内容</label><pre>${escapeHtml(log.message)}</pre>` : ""}
           <label>观察摘要</label>
           <pre>${escapeHtml(log.observation) || "-"}</pre>
-          ${log.follow_up_users && log.follow_up_users.length ? `<label>关注用户</label><pre>${escapeHtml(log.follow_up_users.join(", "))}</pre>` : ""}
-          ${log.follow_up_keywords && log.follow_up_keywords.length ? `<label>关注关键词</label><pre>${escapeHtml(log.follow_up_keywords.join(", "))}</pre>` : ""}
-          ${log.interest_reason ? `<label>关注原因</label><pre>${escapeHtml(log.interest_reason)}</pre>` : ""}
+          ${log.watch_users && log.watch_users.length ? `<label>关注用户</label><pre>${escapeHtml(log.watch_users.join(", "))}</pre>` : ""}
+          ${log.watch_keywords && log.watch_keywords.length ? `<label>关注关键词</label><pre>${escapeHtml(log.watch_keywords.join(", "))}</pre>` : ""}
+          ${log.watch_reason ? `<label>关注原因</label><pre>${escapeHtml(log.watch_reason)}</pre>` : ""}
           <label>LLM 原始响应</label>
           <pre>${escapeHtml(log.response_text)}</pre>
           <label>System Prompt</label>
@@ -410,18 +432,21 @@ async function renderSettings() {
   const { values, meta } = data;
   let html = "";
 
-  const orderedKeys = [
+  const basicKeys = [
     "mute_period", "window_size", "default_n", "default_t", "max_token",
     "quality_threshold", "follow_up_ttl", "follow_up_aggregate_window",
     "trigger_min_interval", "boost_factor", "boost_duration", "max_boosted_replies",
   ];
+  const proactiveKeys = [
+    "proactive_enabled", "proactive_check_interval", "proactive_quiet_minutes",
+    "proactive_max_per_day", "proactive_min_interval", "proactive_drift_delay",
+    "proactive_pending_timeout", "proactive_max_streak", "proactive_instruction",
+    "proactive_max_message_len",
+  ];
 
-  html += '<div class="config-section">';
-  html += '<h3>基本参数</h3>';
-
-  for (const key of orderedKeys) {
+  function renderConfigRow(key) {
     const m = meta[key];
-    if (!m) continue;
+    if (!m) return "";
     const val = values[key];
     const hint = m.hint ? `<div class="config-hint">${escapeHtml(m.hint)}</div>` : "";
 
@@ -434,14 +459,26 @@ async function renderSettings() {
           <input type="number" data-config="${key}.${subKey}" value="${subVal}" min="${subMeta.min}" max="${subMeta.max}" />
         </div>`;
       }
-      html += `<div class="config-row">
+      return `<div class="config-row">
         <label>${escapeHtml(m.label)}</label>
         <div class="config-sub-group">${subItems}</div>
         ${hint}
       </div>`;
+    } else if (m.type === "bool") {
+      return `<div class="config-row">
+        <label>${escapeHtml(m.label)}</label>
+        <input type="checkbox" data-config="${key}" ${val ? "checked" : ""} />
+        ${hint}
+      </div>`;
+    } else if (m.type === "str") {
+      return `<div class="config-row">
+        <label>${escapeHtml(m.label)}</label>
+        <input type="text" data-config="${key}" value="${escapeHtml(val || "")}" />
+        ${hint}
+      </div>`;
     } else {
       const step = m.step || (m.type === "float" ? "0.01" : "1");
-      html += `<div class="config-row">
+      return `<div class="config-row">
         <label>${escapeHtml(m.label)}</label>
         <input type="number" data-config="${key}" value="${val}" min="${m.min}" max="${m.max}" step="${step}" />
         ${hint}
@@ -449,6 +486,12 @@ async function renderSettings() {
     }
   }
 
+  html += '<div class="config-section"><h3>基本参数</h3>';
+  for (const key of basicKeys) html += renderConfigRow(key);
+  html += '</div>';
+
+  html += '<div class="config-section"><h3>主动发起</h3>';
+  for (const key of proactiveKeys) html += renderConfigRow(key);
   html += '</div>';
 
   html += `<div class="config-save-bar">
@@ -466,11 +509,15 @@ async function renderSettings() {
     const payload = {};
     container.querySelectorAll("[data-config]").forEach((input) => {
       const path = input.getAttribute("data-config").split(".");
+      let v;
+      if (input.type === "checkbox") v = input.checked;
+      else if (input.type === "text") v = input.value;
+      else v = parseFloat(input.value);
       if (path.length === 2) {
         if (!payload[path[0]]) payload[path[0]] = {};
-        payload[path[0]][path[1]] = parseFloat(input.value);
+        payload[path[0]][path[1]] = v;
       } else {
-        payload[path[0]] = parseFloat(input.value);
+        payload[path[0]] = v;
       }
     });
 

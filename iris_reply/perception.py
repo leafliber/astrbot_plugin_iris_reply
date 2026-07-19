@@ -110,7 +110,7 @@ class ContextPackager:
         self,
         group_id: str,
         messages: list[WindowMessage],
-        trigger_reason: str,
+        motive: str,
     ) -> str:
         lines: list[str] = []
         token_counts: list[int] = []
@@ -130,7 +130,7 @@ class ContextPackager:
 
         context_text = "\n".join(lines[start:])
 
-        escaped_reason = quoteattr(trigger_reason)
-        header = f"<iris:reply-context trigger_reason={escaped_reason}>\n"
+        escaped_motive = quoteattr(motive)
+        header = f"<iris:reply-context motive={escaped_motive}>\n"
         footer = "\n</iris:reply-context>"
         return header + context_text + footer

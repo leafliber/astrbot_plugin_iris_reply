@@ -5,20 +5,23 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
+from .parser import Decision
+
 
 @dataclass
 class LLMCallLog:
     group_id: str
-    trigger_reason: str
+    motive: str
     system_prompt: str
     user_prompt: str
     response_text: str
-    should_reply: bool
+    action: str
+    message: str
     observation: str
-    follow_up_users: list[str]
-    follow_up_keywords: list[str]
-    interest_reason: str
-    topic_drifted: bool
+    watch_users: list[str]
+    watch_keywords: list[str]
+    watch_reason: str
+    drifted: bool
     timestamp: float
     duration_ms: float = 0.0
 
@@ -26,14 +29,15 @@ class LLMCallLog:
 @dataclass
 class GroupStats:
     group_id: str
-    total_triggers: int = 0
+    total_decisions: int = 0
     total_replies: int = 0
     total_skips: int = 0
     total_errors: int = 0
     total_drifts: int = 0
+    total_initiates: int = 0
     total_passive_replies: int = 0
-    last_trigger_time: float = 0.0
-    last_trigger_reason: str = ""
+    last_decision_time: float = 0.0
+    last_motive: str = ""
     last_reply_time: float = 0.0
     current_state: str = "idle"
     willingness: str = "medium"
@@ -42,6 +46,7 @@ class GroupStats:
     effective_t: int = 0
     backoff_level: int = 0
     consecutive_replies: int = 0
+    initiate_daily_count: int = 0
 
 
 MAX_LOG_ENTRIES = 500
@@ -52,7 +57,6 @@ class StatsCollector:
         self._enabled: bool = False
         self._llm_logs: deque[LLMCallLog] = deque(maxlen=MAX_LOG_ENTRIES)
         self._group_stats: dict[str, GroupStats] = {}
-        self._pending_call: dict[str, dict[str, Any]] = {}
 
     @property
     def enabled(self) -> bool:
@@ -67,77 +71,59 @@ class StatsCollector:
             self._group_stats[group_id] = GroupStats(group_id=group_id)
         return self._group_stats[group_id]
 
-    def record_trigger_start(
+    def record_decision(
         self,
         group_id: str,
-        trigger_reason: str,
+        motive: str,
+        *,
         system_prompt: str,
         user_prompt: str,
-    ) -> None:
-        if not self._enabled:
-            return
-        self._pending_call[group_id] = {
-            "trigger_reason": trigger_reason,
-            "system_prompt": system_prompt,
-            "user_prompt": user_prompt,
-            "start_time": time.time(),
-        }
-        gs = self._ensure_group(group_id)
-        gs.total_triggers += 1
-        gs.last_trigger_time = time.time()
-        gs.last_trigger_reason = trigger_reason
-
-    def record_trigger_result(
-        self,
-        group_id: str,
         response_text: str,
-        should_reply: bool,
-        observation: str,
-        follow_up_users: list[str],
-        follow_up_keywords: list[str],
-        interest_reason: str,
-        topic_drifted: bool,
+        decision: Decision,
+        duration_ms: float,
     ) -> None:
         if not self._enabled:
             return
-        pending = self._pending_call.pop(group_id, None)
-        if not pending:
-            return
-        start_time = pending["start_time"]
-        duration_ms = (time.time() - start_time) * 1000
-
         log = LLMCallLog(
             group_id=group_id,
-            trigger_reason=pending["trigger_reason"],
-            system_prompt=pending["system_prompt"],
-            user_prompt=pending["user_prompt"],
+            motive=motive,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
             response_text=response_text,
-            should_reply=should_reply,
-            observation=observation,
-            follow_up_users=follow_up_users,
-            follow_up_keywords=follow_up_keywords,
-            interest_reason=interest_reason,
-            topic_drifted=topic_drifted,
+            action=decision.action,
+            message=decision.message,
+            observation=decision.observation,
+            watch_users=decision.watch,
+            watch_keywords=decision.watch_keywords,
+            watch_reason=decision.why,
+            drifted=decision.drifted,
             timestamp=time.time(),
             duration_ms=duration_ms,
         )
         self._llm_logs.append(log)
 
         gs = self._ensure_group(group_id)
-        if topic_drifted:
+        gs.total_decisions += 1
+        gs.last_decision_time = time.time()
+        gs.last_motive = motive
+        if decision.drifted:
             gs.total_drifts += 1
-        elif should_reply:
+        elif decision.should_speak:
             gs.total_replies += 1
             gs.last_reply_time = time.time()
+            if motive == "initiate":
+                gs.total_initiates += 1
         else:
             gs.total_skips += 1
 
-    def record_trigger_error(self, group_id: str) -> None:
+    def record_decision_error(self, group_id: str, motive: str) -> None:
         if not self._enabled:
             return
-        self._pending_call.pop(group_id, None)
         gs = self._ensure_group(group_id)
+        gs.total_decisions += 1
         gs.total_errors += 1
+        gs.last_decision_time = time.time()
+        gs.last_motive = motive
 
     def record_passive_reply(self, group_id: str) -> None:
         if not self._enabled:
@@ -156,6 +142,7 @@ class StatsCollector:
         effective_t: int,
         backoff_level: int,
         consecutive_replies: int,
+        initiate_daily_count: int,
     ) -> None:
         if not self._enabled:
             return
@@ -167,30 +154,35 @@ class StatsCollector:
         gs.effective_t = effective_t
         gs.backoff_level = backoff_level
         gs.consecutive_replies = consecutive_replies
+        gs.initiate_daily_count = initiate_daily_count
+
+    @staticmethod
+    def _summary(gs: GroupStats) -> dict[str, Any]:
+        return {
+            "group_id": gs.group_id,
+            "total_decisions": gs.total_decisions,
+            "total_replies": gs.total_replies,
+            "total_skips": gs.total_skips,
+            "total_errors": gs.total_errors,
+            "total_drifts": gs.total_drifts,
+            "total_initiates": gs.total_initiates,
+            "total_passive_replies": gs.total_passive_replies,
+            "last_decision_time": gs.last_decision_time,
+            "last_motive": gs.last_motive,
+            "last_reply_time": gs.last_reply_time,
+            "current_state": gs.current_state,
+            "willingness": gs.willingness,
+            "msg_count": gs.msg_count,
+            "effective_n": gs.effective_n,
+            "effective_t": gs.effective_t,
+            "backoff_level": gs.backoff_level,
+            "consecutive_replies": gs.consecutive_replies,
+            "initiate_daily_count": gs.initiate_daily_count,
+        }
 
     def get_group_summaries(self) -> list[dict[str, Any]]:
-        result = []
-        for gs in self._group_stats.values():
-            result.append({
-                "group_id": gs.group_id,
-                "total_triggers": gs.total_triggers,
-                "total_replies": gs.total_replies,
-                "total_skips": gs.total_skips,
-                "total_errors": gs.total_errors,
-                "total_drifts": gs.total_drifts,
-                "total_passive_replies": gs.total_passive_replies,
-                "last_trigger_time": gs.last_trigger_time,
-                "last_trigger_reason": gs.last_trigger_reason,
-                "last_reply_time": gs.last_reply_time,
-                "current_state": gs.current_state,
-                "willingness": gs.willingness,
-                "msg_count": gs.msg_count,
-                "effective_n": gs.effective_n,
-                "effective_t": gs.effective_t,
-                "backoff_level": gs.backoff_level,
-                "consecutive_replies": gs.consecutive_replies,
-            })
-        result.sort(key=lambda x: x["last_trigger_time"], reverse=True)
+        result = [self._summary(gs) for gs in self._group_stats.values()]
+        result.sort(key=lambda x: x["last_decision_time"], reverse=True)
         return result
 
     def get_llm_logs(
@@ -208,16 +200,17 @@ class StatsCollector:
         for log in sliced:
             result.append({
                 "group_id": log.group_id,
-                "trigger_reason": log.trigger_reason,
+                "motive": log.motive,
                 "system_prompt": log.system_prompt,
                 "user_prompt": log.user_prompt,
                 "response_text": log.response_text,
-                "should_reply": log.should_reply,
+                "action": log.action,
+                "message": log.message,
                 "observation": log.observation,
-                "follow_up_users": log.follow_up_users,
-                "follow_up_keywords": log.follow_up_keywords,
-                "interest_reason": log.interest_reason,
-                "topic_drifted": log.topic_drifted,
+                "watch_users": log.watch_users,
+                "watch_keywords": log.watch_keywords,
+                "watch_reason": log.watch_reason,
+                "drifted": log.drifted,
                 "timestamp": log.timestamp,
                 "duration_ms": round(log.duration_ms, 1),
             })
@@ -227,27 +220,8 @@ class StatsCollector:
         gs = self._group_stats.get(group_id)
         if not gs:
             return None
-        return {
-            "group_id": gs.group_id,
-            "total_triggers": gs.total_triggers,
-            "total_replies": gs.total_replies,
-            "total_skips": gs.total_skips,
-            "total_errors": gs.total_errors,
-            "total_drifts": gs.total_drifts,
-            "total_passive_replies": gs.total_passive_replies,
-            "last_trigger_time": gs.last_trigger_time,
-            "last_trigger_reason": gs.last_trigger_reason,
-            "last_reply_time": gs.last_reply_time,
-            "current_state": gs.current_state,
-            "willingness": gs.willingness,
-            "msg_count": gs.msg_count,
-            "effective_n": gs.effective_n,
-            "effective_t": gs.effective_t,
-            "backoff_level": gs.backoff_level,
-            "consecutive_replies": gs.consecutive_replies,
-        }
+        return self._summary(gs)
 
     def clear_logs(self) -> None:
         self._llm_logs.clear()
         self._group_stats.clear()
-        self._pending_call.clear()
